@@ -109,16 +109,22 @@ Accepted ranges and rejection semantics:
 
 | Parameter | Entrypoint(s) | Accepted range | Error if invalid |
 |-----------|----------------|----------------|------------------|
+| `supply_cap` | `register_offering` | >= 0 | `InvalidAmount` |
 | `revenue_share_bps` | `register_offering` | 0–10000 (testnet: any) | `InvalidRevenueShareBps` |
 | `share_bps` | `set_holder_share` | 0–10000 | `InvalidShareBps` |
-| `amount` | `report_revenue` | > 0 | `InvalidAmount` |
+| `amount` | `report_revenue` | >= 0 | `InvalidAmount` |
 | `amount` | `deposit_revenue` | > 0 | `InvalidAmount` |
+| `amount` | `deposit_revenue_with_snapshot` | > 0 | `InvalidAmount` |
+| `snapshot_reference` | `deposit_revenue_with_snapshot` | > 0 | `InvalidAmount` |
 | `period_id` | `deposit_revenue` | > 0 | `InvalidPeriodId` |
+| `min_stake` | `set_investment_constraints` | >= 0 | `InvalidAmount` |
+| `max_stake` | `set_investment_constraints` | >= 0 and `>= min_stake` when set | `InvalidAmount` |
 | `period_id` | `report_revenue` | any u64 | — |
 | `min_amount` | `set_min_revenue_threshold` | ≥ 0 | `InvalidAmount` |
-| `fee_bps` | `set_platform_fee` | 0–5000 | `LimitReached` |
 
 Use `try_*` client methods to receive these errors as `Result`.
+Consolidated invalid-amount regression coverage lives in `src/invalid_amount_matrix_tests.rs`; the checklist is in `docs/negative-amount-validation-matrix.md`.
+This branch's public fee-related amount helper is `calculate_fee_for_asset`; it is a pure quote helper and is documented separately from the `InvalidAmount` rejection matrix.
 
 ---
 

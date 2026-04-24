@@ -6,6 +6,9 @@ use soroban_sdk::{
     BytesN, Env, IntoVal, Map, String, Symbol, Vec,
 };
 
+#[cfg(test)]
+mod invalid_amount_matrix_tests;
+
 // Issue #109 — Revenue report correction workflow with audit trail.
 // Placeholder branch for upstream PR scaffolding; full implementation in follow-up.
 
@@ -4980,7 +4983,10 @@ impl RevenueDepositContract {
         env.storage().persistent().get(&DataKey::PlatformFeeBps).unwrap_or(0)
     }
 
-    /// Calculate fee for (offering, asset, amount) using effective fee bps.
+    /// Calculate a fee quote for `(offering, asset, amount)` using the effective fee bps.
+    ///
+    /// This is a pure preview helper for off-chain callers. It does not mutate state and does not
+    /// participate in the `InvalidAmount` rejection matrix used by state-changing entrypoints.
     pub fn calculate_fee_for_asset(
         env: Env,
         issuer: Address,
