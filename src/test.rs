@@ -39,7 +39,7 @@ fn setup() -> (Env, Address, Address, Address) {
 
     // Deploy a mock token (Stellar asset contract)
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_id = crate::test_utils::create_token(&env, &token_admin);
 
     // Deploy the revenue deposit contract
     let contract_id = env.register_contract(None, RevenueDepositContract);
@@ -47,7 +47,7 @@ fn setup() -> (Env, Address, Address, Address) {
     let admin = Address::generate(&env);
 
     // Mint tokens to admin so they can deposit
-    StellarAssetClient::new(&env, &token_id).mint(&admin, &1_000_000);
+    crate::test_utils::mint_tokens(&env, &token_id, &admin, 1_000_000);
 
     // Initialise
     let client = RevenueDepositContractClient::new(&env, &contract_id);
@@ -97,9 +97,8 @@ fn test_create_period_happy_path() {
     assert_eq!(period.claimed_amount, 0);
 
     // Tokens should have moved from admin to contract
-    let token = TokenClient::new(&env, &token_id);
-    assert_eq!(token.balance(&contract_id), 10_000);
-    assert_eq!(token.balance(&admin), 1_000_000 - 10_000);
+    assert_eq!(crate::test_utils::get_balance(&env, &token_id, &contract_id), 10_000);
+    assert_eq!(crate::test_utils::get_balance(&env, &token_id, &admin), 1_000_000 - 10_000);
 }
 
 #[test]
@@ -298,18 +297,7 @@ fn test_remove_beneficiary_not_registered() {
 // ─── 4. Claims ────────────────────────────────────────────────────────────────
 
 /// Helper: advance the ledger past a period's end.
-fn advance_past(env: &Env, ledger: u32) {
-    env.ledger().set(soroban_sdk::testutils::LedgerInfo {
-        timestamp: 12345,
-        protocol_version: 20,
-        sequence_number: ledger + 1,
-        network_id: Default::default(),
-        base_reserve: 10,
-        min_temp_entry_ttl: 10,
-        min_persistent_entry_ttl: 10,
-        max_entry_ttl: 6_312_000,
-    });
-}
+
 
 #[test]
 fn test_claim_single_beneficiary() {
@@ -320,13 +308,12 @@ fn test_claim_single_beneficiary() {
     let b = Address::generate(&env);
     client.add_beneficiary(&period_id, &b);
 
-    advance_past(&env, 200);
+    crate::test_utils::advance_past(&env, 200);
 
     let share = client.claim(&period_id, &b);
     assert_eq!(share, 10_000);
 
-    let token = TokenClient::new(&env, &token_id);
-    assert_eq!(token.balance(&b), 10_000);
+    assert_eq!(crate::test_utils::get_balance(&env, &token_id, &b), 10_000);
 
     // Verify period state updated
     let period = client.get_period(&period_id);
@@ -346,7 +333,7 @@ fn test_claim_multiple_beneficiaries_equal_split() {
     client.add_beneficiary(&period_id, &b2);
     client.add_beneficiary(&period_id, &b3);
 
-    advance_past(&env, 200);
+    crate::test_utils::advance_past(&env, 200);
 
     let share1 = client.claim(&period_id, &b1);
     let share2 = client.claim(&period_id, &b2);
@@ -356,10 +343,9 @@ fn test_claim_multiple_beneficiaries_equal_split() {
     assert_eq!(share2, 3_000);
     assert_eq!(share3, 3_000);
 
-    let token = TokenClient::new(&env, &token_id);
-    assert_eq!(token.balance(&b1), 3_000);
-    assert_eq!(token.balance(&b2), 3_000);
-    assert_eq!(token.balance(&b3), 3_000);
+    assert_eq!(crate::test_utils::get_balance(&env, &token_id, &b1), 3_000);
+    assert_eq!(crate::test_utils::get_balance(&env, &token_id, &b2), 3_000);
+    assert_eq!(crate::test_utils::get_balance(&env, &token_id, &b3), 3_000);
 }
 
 #[test]
@@ -376,15 +362,14 @@ fn test_claim_floor_division_remainder_stays_in_contract() {
     client.add_beneficiary(&period_id, &b2);
     client.add_beneficiary(&period_id, &b3);
 
-    advance_past(&env, 200);
+    crate::test_utils::advance_past(&env, 200);
 
     assert_eq!(client.claim(&period_id, &b1), 3_333);
     assert_eq!(client.claim(&period_id, &b2), 3_333);
     assert_eq!(client.claim(&period_id, &b3), 3_333);
 
     // 2 tokens remain locked in contract
-    let token = TokenClient::new(&env, &token_id);
-    assert_eq!(token.balance(&contract_id), 2);
+    assert_eq!(crate::test_utils::get_balance(&env, &token_id, &contract_id), 2);
 }
 
 #[test]
@@ -438,7 +423,7 @@ fn test_claim_double_claim_rejected() {
     let period_id = client.create_period(&100u32, &200u32, &10_000i128);
     let b = Address::generate(&env);
     client.add_beneficiary(&period_id, &b);
-    advance_past(&env, 200);
+    crate::test_utils::advance_past(&env, 200);
 
     client.claim(&period_id, &b);
 
@@ -457,7 +442,7 @@ fn test_claim_non_beneficiary_rejected() {
     let b = Address::generate(&env);
     client.add_beneficiary(&period_id, &b);
 
-    advance_past(&env, 200);
+    crate::test_utils::advance_past(&env, 200);
 
     let stranger = Address::generate(&env);
     assert_eq!(
@@ -486,7 +471,7 @@ fn test_claim_no_beneficiaries() {
     let period_id = client.create_period(&100u32, &200u32, &10_000i128);
     let b = Address::generate(&env);
 
-    advance_past(&env, 200);
+    crate::test_utils::advance_past(&env, 200);
 
     // No beneficiaries registered, but b tries to claim
     assert_eq!(
@@ -519,7 +504,7 @@ fn test_has_claimed_returns_correct_values() {
 
     assert!(!client.has_claimed(&period_id, &b));
 
-    advance_past(&env, 200);
+    crate::test_utils::advance_past(&env, 200);
     client.claim(&period_id, &b);
 
     assert!(client.has_claimed(&period_id, &b));
@@ -536,7 +521,7 @@ fn test_unclaimed_summary() {
     let b = Address::generate(&env);
     client.add_beneficiary(&p0, &b);
 
-    advance_past(&env, 299);
+    crate::test_utils::advance_past(&env, 299);
     client.claim(&p0, &b);
 
     let summary = client.unclaimed_summary();
@@ -563,7 +548,7 @@ fn test_claims_across_multiple_periods_independent() {
     client.add_beneficiary(&p0, &b2);
     client.add_beneficiary(&p1, &b1);
 
-    advance_past(&env, 299);
+    crate::test_utils::advance_past(&env, 299);
 
     // Period 0: 4000 / 2 = 2000 each
     assert_eq!(client.claim(&p0, &b1), 2_000);
@@ -572,9 +557,8 @@ fn test_claims_across_multiple_periods_independent() {
     // Period 1: 8000 / 1 = 8000 for b1
     assert_eq!(client.claim(&p1, &b1), 8_000);
 
-    let token = TokenClient::new(&env, &token_id);
-    assert_eq!(token.balance(&b1), 10_000);
-    assert_eq!(token.balance(&b2), 2_000);
+    assert_eq!(crate::test_utils::get_balance(&env, &token_id, &b1), 10_000);
+    assert_eq!(crate::test_utils::get_balance(&env, &token_id, &b2), 2_000);
 
     // b2 not in p1 — should be rejected
     assert_eq!(
@@ -596,7 +580,7 @@ fn test_removing_beneficiary_before_claim_excludes_them() {
     client.add_beneficiary(&period_id, &b2);
     client.remove_beneficiary(&period_id, &b2); // remove before period ends
 
-    advance_past(&env, 200);
+    crate::test_utils::advance_past(&env, 200);
 
     // b1 gets full share (only one beneficiary now)
     assert_eq!(client.claim(&period_id, &b1), 6_000);
@@ -614,7 +598,7 @@ fn test_large_beneficiary_count() {
     let client = RevenueDepositContractClient::new(&env, &contract_id);
 
     // Mint enough tokens
-    StellarAssetClient::new(&env, &token_id).mint(&admin, &100_000_000);
+    crate::test_utils::mint_tokens(&env, &token_id, &admin, 100_000_000);
 
     let n: u32 = 50;
     let amount: i128 = n as i128 * 1_000; // perfectly divisible
@@ -633,7 +617,7 @@ fn test_large_beneficiary_count() {
             v
         });
 
-    advance_past(&env, 200);
+    crate::test_utils::advance_past(&env, 200);
 
     client.whitelist_add(&admin, &issuer, &symbol_short!("def"), &token, &investor);
     client.whitelist_remove(&admin, &issuer, &symbol_short!("def"), &token, &investor);
