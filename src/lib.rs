@@ -5144,3 +5144,6 @@ impl RevenueDepositContract {
         fixtures
     }
 }
+
+#[cfg(test)]
+mod test_snapshot_negative_matrix;
