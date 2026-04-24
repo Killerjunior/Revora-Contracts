@@ -1838,6 +1838,12 @@ impl RevoraRevenueShare {
         Ok(corrected)
     }
 
+    /// Return the cumulative reported revenue for a single `period_id` of an offering.
+    ///
+    /// Returns `0` if no revenue has been reported for that period.
+    ///
+    /// ### Auth
+    /// None — read-only.
     pub fn get_revenue_by_period(
         env: Env,
         issuer: Address,
@@ -1850,6 +1856,12 @@ impl RevoraRevenueShare {
         env.storage().persistent().get(&key).unwrap_or(0)
     }
 
+    /// Sum reported revenue for all period IDs in `[from_period, to_period]` (inclusive).
+    ///
+    /// **Warning:** unbounded range — for large ranges prefer [`get_revenue_range_chunk`].
+    ///
+    /// ### Auth
+    /// None — read-only.
     pub fn get_revenue_range(
         env: Env,
         issuer: Address,
@@ -4127,6 +4139,21 @@ impl RevoraRevenueShare {
 
     // ── Admin rotation safety flow (Issue #191) ───────────────
 
+    /// Propose a two-step admin rotation to `new_admin`.
+    ///
+    /// The current admin initiates; `new_admin` must call [`accept_admin_rotation`] to complete.
+    /// Only one rotation may be pending at a time.
+    ///
+    /// ### Auth
+    /// Current admin (`require_auth`).
+    ///
+    /// ### Errors
+    /// - `AdminRotationSameAddress` — `new_admin` equals current admin.
+    /// - `AdminRotationPending` — a rotation is already pending; cancel it first.
+    /// - `ContractFrozen` — contract is frozen.
+    ///
+    /// ### Events
+    /// Emits `adm_prop`: `(adm_prop, current_admin)` → `new_admin`.
     pub fn propose_admin_rotation(env: Env, new_admin: Address) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
 
@@ -4150,6 +4177,18 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
+    /// Accept a pending admin rotation. Completes the transfer and grants admin to `new_admin`.
+    ///
+    /// ### Auth
+    /// `new_admin` must authorize (`require_auth`). Caller must match the pending proposed address.
+    ///
+    /// ### Errors
+    /// - `NoAdminRotationPending` — no rotation was proposed.
+    /// - `UnauthorizedRotationAccept` — caller does not match the pending proposed address.
+    /// - `ContractFrozen` — contract is frozen.
+    ///
+    /// ### Events
+    /// Emits `adm_acc`: `(adm_acc, old_admin)` → `new_admin`.
     pub fn accept_admin_rotation(env: Env, new_admin: Address) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
 
@@ -4176,6 +4215,17 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
+    /// Cancel a pending admin rotation before it is accepted.
+    ///
+    /// ### Auth
+    /// Current admin (`require_auth`).
+    ///
+    /// ### Errors
+    /// - `NoAdminRotationPending` — no rotation is pending.
+    /// - `ContractFrozen` — contract is frozen.
+    ///
+    /// ### Events
+    /// Emits `adm_canc`: `(adm_canc, current_admin)` → `proposed_new_admin`.
     pub fn cancel_admin_rotation(env: Env) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
 
@@ -4197,6 +4247,10 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
+    /// Return the proposed new admin address for a pending rotation, or `None` if none is pending.
+    ///
+    /// ### Auth
+    /// None — read-only.
     pub fn get_pending_admin_rotation(env: Env) -> Option<Address> {
         env.storage().persistent().get(&DataKey::PendingAdmin)
     }
