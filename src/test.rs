@@ -195,6 +195,12 @@ fn test_create_period_accepts_adjacent_non_overlapping() {
     let (env, contract_id, _token_id, _admin) = setup();
     let client = RevenueDepositContractClient::new(&env, &contract_id);
 
+    // Two adjacent periods: [100, 199] and [200, 299] — no overlap
+    let id0 = client.create_period(&100u32, &199u32, &1_000i128);
+    let id1 = client.create_period(&200u32, &299u32, &1_000i128);
+    assert_ne!(id0, id1);
+}
+
 #[test]
 fn test_create_period_unauthorized() {
     let (env, contract_id, _token_id, _admin) = setup();
