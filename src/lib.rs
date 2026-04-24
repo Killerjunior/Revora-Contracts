@@ -4848,3 +4848,10 @@ mod vesting_test;
 /// return `ContractFrozen` when the contract is frozen, with no partial writes.
 #[cfg(test)]
 mod test_freeze_matrix;
+
+/// Report/claim window time boundary matrix tests.
+/// Covers start/end inclusivity, zero-width windows, reconfiguration mid-flight,
+/// deposit_revenue window-independence, and claim-delay orthogonality.
+/// See docs/time-window-boundary-matrix.md for the full security/risk notes.
+#[cfg(test)]
+mod test_time_windows;

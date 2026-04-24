@@ -52,13 +52,16 @@ Soroban contract for revenue-share offerings and blacklist management.
 | Code | Name | Meaning |
 |------|------|---------|
 | 1 | `InvalidRevenueShareBps` | `revenue_share_bps` > 10000. |
-| 2 | `LimitReached` | Reserved / offering not found (e.g. for set_concentration_limit, set_rounding_mode). |
+| 2 | `LimitReached` | Reserved / offering not found (e.g. for set_concentration_limit, set_rounding_mode). Also returned when `set_report_window` / `set_claim_window` is called with `start > end`. |
 | 3 | `ConcentrationLimitExceeded` | Holder concentration exceeds configured limit and enforcement is on; `report_revenue` rejected. |
+| 11 | `ClaimDelayNotElapsed` | Revenue for this period is not yet claimable; the per-offering delay has not elapsed since deposit. |
 | 12 | `IssuerTransferPending` | A transfer is already pending for this offering. |
 | 13 | `NoTransferPending` | No transfer is pending for this offering (accept/cancel failed). |
 | 14 | `UnauthorizedTransferAccept` | Caller is not authorized to accept this transfer. |
 | 17 | `InvalidAmount` | Amount is invalid (e.g. negative, or zero for deposit) (#35). |
 | 18 | `InvalidPeriodId` | period_id is 0 where a positive value is required (#35). |
+| 25 | `ReportingWindowClosed` | Current ledger timestamp is outside the configured reporting window; `report_revenue` rejected. |
+| 26 | `ClaimWindowClosed` | Current ledger timestamp is outside the configured claiming window; `claim` rejected. |
 
 Auth failures (e.g. wrong signer) are signaled by host/panic, not `RevoraError`. Use `try_register_offering`, `try_report_revenue`, and similar `try_*` client methods to receive contract errors as `Result`.
 
@@ -73,6 +76,8 @@ Auth failures (e.g. wrong signer) are signaled by host/panic, not `RevoraError`.
 | `min_rev` | `(issuer, token), (previous_amount, new_amount)` | When `set_min_revenue_threshold` is set or changed. |
 | `rev_below` | `(issuer, token), (amount, period_id, threshold)` | When `report_revenue` is called with amount below the offering's minimum threshold; no report/audit update. |
 | `conc_warn` | `(issuer, token), (concentration_bps, limit_bps)` | When `report_concentration` is called and reported concentration exceeds configured limit (warning only; enforce blocks at `report_revenue`). |
+| `rep_win` | `(issuer, namespace, token), (start_timestamp, end_timestamp)` | When `set_report_window` is called. |
+| `clm_win` | `(issuer, namespace, token), (start_timestamp, end_timestamp)` | When `set_claim_window` is called. |
 | `iss_prop` | `(token), (current_issuer, proposed_new_issuer)` | When `propose_issuer_transfer` is called. |
 | `iss_acc` | `(token), (old_issuer, new_issuer)` | When `accept_issuer_transfer` completes the transfer. |
 | `iss_canc` | `(token), (current_issuer, proposed_new_issuer)` | When `cancel_issuer_transfer` revokes a pending transfer. |
@@ -93,8 +98,78 @@ Auth failures (e.g. wrong signer) are signaled by host/panic, not `RevoraError`.
 - **Rounding:** Use `compute_share(amount, revenue_share_bps, mode)` for consistent distribution math. Per-offering default is `get_rounding_mode(issuer, token)` (Truncation if unset). Sum of shares must not exceed total; both modes keep result in [0, amount].
 - **Issuer Transfer:** See [ISSUER_TRANSFER.md](./ISSUER_TRANSFER.md) for comprehensive documentation on securely transferring issuer control via the two-step propose/accept flow.
 - **Testnet mode:** Admin can enable testnet mode via `set_testnet_mode(true)` to relax certain validations for non-production deployments. When enabled: (1) `register_offering` allows `revenue_share_bps > 10000`, (2) `report_revenue` skips concentration enforcement. Use only for testnet/development environments. Check mode with `is_testnet_mode()`.
+- **Reporting and claiming windows:** Issuers can optionally restrict when `report_revenue` and `claim` are permitted using time-based access windows. See [Time Windows](#time-based-access-windows-reporting--claiming) below.
 
-### Contract version and migration (#23)
+### Time-Based Access Windows (Reporting & Claiming)
+
+Issuers can configure per-offering time windows that gate `report_revenue` and `claim`.
+If no window is set, the operation is always permitted.
+
+#### Soroban Time Source
+
+All window checks use `env.ledger().timestamp()` — the Unix timestamp (seconds since
+epoch) of the current ledger's close time. This value is set by Stellar network
+consensus and is monotonically non-decreasing. It is **not** manipulable per-transaction.
+
+#### Window Methods
+
+| Method | Auth | Description |
+|--------|------|-------------|
+| `set_report_window(issuer, namespace, token, start_timestamp, end_timestamp)` | issuer | Configure when `report_revenue` is permitted. If unset, always open. |
+| `set_claim_window(issuer, namespace, token, start_timestamp, end_timestamp)` | issuer | Configure when `claim` is permitted. If unset, always open. |
+| `get_report_window(issuer, namespace, token)` | — | Read current report window (`None` if unset). |
+| `get_claim_window(issuer, namespace, token)` | — | Read current claim window (`None` if unset). |
+
+#### Boundary Semantics
+
+Windows are **inclusive on both ends**: a transaction whose ledger closes at exactly
+`start_timestamp` or `end_timestamp` is permitted.
+
+```
+is_open = now >= start_timestamp && now <= end_timestamp
+```
+
+| `now` vs `[start, end]` | Result |
+|------------------------|--------|
+| `now < start` | Closed (`ReportingWindowClosed` / `ClaimWindowClosed`) |
+| `now == start` | **Open** (inclusive) |
+| `start < now < end` | Open |
+| `now == end` | **Open** (inclusive) |
+| `now > end` | Closed |
+
+#### Zero-Width Windows
+
+Setting `start_timestamp == end_timestamp` is valid and creates a single-second
+eligibility slot. This is intentional but operationally fragile in production — prefer
+windows with meaningful duration (≥ 3600 seconds).
+
+#### Which Operations Are Gated
+
+| Operation | Report Window | Claim Window |
+|-----------|:---:|:---:|
+| `report_revenue` | ✅ gated | — |
+| `deposit_revenue` | — | — (never gated) |
+| `claim` | — | ✅ gated |
+
+`deposit_revenue` is **never** time-window gated. Issuers can always deposit revenue
+regardless of any configured window.
+
+#### Reconfiguration Mid-Flight
+
+Windows can be changed at any time via `set_report_window` / `set_claim_window`. The
+contract applies the window active at the **ledger that closes the transaction** — not
+at submission time. Use sufficiently wide windows to reduce reconfiguration races.
+
+#### Claim Delay vs Claim Window
+
+The per-offering `ClaimDelaySecs` (set via `set_claim_delay`) and the claim window are
+independent. The claim window is checked first; if open, the per-period delay is then
+checked inside the claim loop. Both must pass for a period to be claimable.
+
+For the full boundary matrix, zero-width window notes, and security/risk analysis see
+[docs/time-window-boundary-matrix.md](./docs/time-window-boundary-matrix.md).
+
+
 
 - **Version:** Call `get_version()` to read the current contract version (a constant, e.g. `1`). This value is bumped when storage layout or semantics change in a way that affects compatibility.
 - **Upgrade strategy:** This codebase deploys a single WASM contract; there is no in-place upgrade. Future upgrades are expected to:
