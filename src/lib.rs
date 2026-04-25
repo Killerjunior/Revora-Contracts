@@ -1747,21 +1747,20 @@ impl RevoraRevenueShare {
             );
         }
 
-            env.events().publish(
-                (EVENT_REV_INIA_V1, issuer.clone(), namespace.clone(), token.clone()),
-                (EVENT_SCHEMA_VERSION, payout_asset.clone(), amount, period_id, blacklist.clone()),
-            );
+        env.events().publish(
+            (EVENT_REV_INIA_V1, issuer.clone(), namespace.clone(), token.clone()),
+            (EVENT_SCHEMA_VERSION, payout_asset.clone(), amount, period_id, blacklist.clone()),
+        );
 
-            env.events().publish(
-                (EVENT_REV_REP_V1, issuer.clone(), namespace.clone(), token.clone()),
-                (EVENT_SCHEMA_VERSION, amount, period_id, blacklist.clone()),
-            );
+        env.events().publish(
+            (EVENT_REV_REP_V1, issuer.clone(), namespace.clone(), token.clone()),
+            (EVENT_SCHEMA_VERSION, amount, period_id, blacklist.clone()),
+        );
 
-            env.events().publish(
-                (EVENT_REV_REPA_V1, issuer.clone(), namespace.clone(), token.clone()),
-                (EVENT_SCHEMA_VERSION, payout_asset.clone(), amount, period_id),
-            );
-        }
+        env.events().publish(
+            (EVENT_REV_REPA_V1, issuer.clone(), namespace.clone(), token.clone()),
+            (EVENT_SCHEMA_VERSION, payout_asset.clone(), amount, period_id),
+        );
 
         Ok(())
     }
