@@ -7014,4 +7014,91 @@ mod regression {
         let r = client.try_set_min_revenue_threshold(&issuer, &symbol_short!("def"), &token, &0);
         assert!(r.is_ok());
     }
+
+    #[test]
+    fn test_reconciliation_completeness() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = make_client(&env);
+        let admin = Address::generate(&env);
+        client.set_admin(&admin);
+
+        let issuer = Address::generate(&env);
+        let token = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let ns = symbol_short!("def");
+
+        // Test set_platform_fee
+        client.set_platform_fee(&500);
+        
+        // Test set_platform_fee_per_asset
+        client.set_platform_fee_per_asset(&asset, &300);
+
+        // Test set_offering_fee_bps
+        client.set_offering_fee_bps(&issuer, &ns, &token, &asset, &200);
+
+        // Test set_concentration_limit
+        client.set_concentration_limit(&issuer, &ns, &token, &1000, &true);
+
+        // Test set_rounding_mode
+        client.set_rounding_mode(&issuer, &ns, &token, &RoundingMode::Truncation);
+
+        // Test register_meta_signer_key
+        let signer = Address::generate(&env);
+        client.register_meta_signer_key(&signer, &BytesN::from_array(&env, &[0u8; 32]));
+
+        // Test set_meta_delegate
+        let delegate = Address::generate(&env);
+        client.set_meta_delegate(&issuer, &ns, &token, &delegate);
+
+        // Test init_multisig
+        let owners = soroban_sdk::vec![&env, admin.clone()];
+        client.init_multisig(&admin, &owners, &1, &86400);
+
+        // Test execute_action
+        let proposal_id = client.propose_action(&admin, &ProposalAction::Freeze).unwrap();
+        client.execute_action(&proposal_id);
+
+        // Verify events
+        let events = env.events().all();
+        
+        let mut found_admin = false;
+        let mut found_platform = false;
+        let mut found_asset = false;
+        let mut found_offering = false;
+        let mut found_conc = false;
+        let mut found_rounding = false;
+        let mut found_meta_key = false;
+        let mut found_meta_del = false;
+        let mut found_ms_init = false;
+        let mut found_ms_exec = false;
+
+        for event in events.iter() {
+            let topics = event.topics;
+            if topics.len() > 0 {
+                let topic: Symbol = topics.get(0).unwrap().try_into().unwrap();
+                if topic == symbol_short!("admin_set") { found_admin = true; }
+                if topic == symbol_short!("fee_set") { found_platform = true; }
+                if topic == symbol_short!("fee_ast") { found_asset = true; }
+                if topic == symbol_short!("fee_off") { found_offering = true; }
+                if topic == symbol_short!("conc_lim") { found_conc = true; }
+                if topic == symbol_short!("rnd_mode") { found_rounding = true; }
+                if topic == symbol_short!("meta_key") { found_meta_key = true; }
+                if topic == symbol_short!("meta_del") { found_meta_del = true; }
+                if topic == symbol_short!("ms_init") { found_ms_init = true; }
+                if topic == symbol_short!("prop_e2") { found_ms_exec = true; }
+            }
+        }
+
+        assert!(found_admin, "EVENT_ADMIN_SET not found");
+        assert!(found_platform, "EVENT_PLATFORM_FEE_SET not found");
+        assert!(found_asset, "EVENT_PLATFORM_FEE_ASSET_SET not found");
+        assert!(found_offering, "EVENT_OFFERING_FEE_SET not found");
+        assert!(found_conc, "EVENT_CONC_LIMIT_SET not found");
+        assert!(found_rounding, "EVENT_ROUNDING_MODE_SET not found");
+        assert!(found_meta_key, "EVENT_META_SIGNER_SET not found");
+        assert!(found_meta_del, "EVENT_META_DELEGATE_SET not found");
+        assert!(found_ms_init, "EVENT_MULTISIG_INIT not found");
+        assert!(found_ms_exec, "EVENT_PROPOSAL_EXECUTED_V2 not found");
+    }
 }
