@@ -5144,3 +5144,9 @@ impl RevenueDepositContract {
         fixtures
     }
 }
+
+// ── Test modules ──────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod test_indexer_fixtures;
+#[cfg(test)]
+mod milestone_signals;
