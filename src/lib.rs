@@ -79,15 +79,21 @@ pub enum RevoraError {
     /// Multisig proposal has expired.
     ProposalExpired = 30,
     /// Cross-contract token transfer failed.
-    TransferFailed = 30,
+    TransferFailed = 31,
     /// Contract is already at the target version; no migration needed.
-    AlreadyAtTargetVersion = 31,
+    AlreadyAtTargetVersion = 32,
     /// Target version is lower than the current deployed version.
-    MigrationDowngradeNotAllowed = 32,
+    MigrationDowngradeNotAllowed = 33,
     /// Admin rotation failed: new admin cannot be the same as current.
-    AdminRotationSameAddress = 33,
+    AdminRotationSameAddress = 34,
     /// Admin rotation failed: another rotation is already pending.
-    AdminRotationPending = 34,
+    AdminRotationPending = 35,
+    /// Admin rotation failed: no rotation is currently pending.
+    NoAdminRotationPending = 36,
+    /// Blacklist size limit exceeded; remove an entry before adding a new one.
+    BlacklistSizeLimitExceeded = 37,
+    /// Caller is not authorized to accept this admin rotation.
+    UnauthorizedRotationAccept = 38,
 }
 
 // ── Event symbols ────────────────────────────────────────────
@@ -1745,7 +1751,6 @@ impl RevoraRevenueShare {
                 (EVENT_REV_INIA_V2, issuer.clone(), namespace.clone(), token.clone()),
                 (payout_asset.clone(), amount, period_id, blacklist.clone()),
             );
-        }
 
             env.events().publish(
                 (EVENT_REV_INIA_V1, issuer.clone(), namespace.clone(), token.clone()),
@@ -4446,7 +4451,41 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
-#![no_std]
+    /// Execute an approved multisig proposal once the threshold is reached.
+    pub fn execute_action(
+        env: Env,
+        executor: Address,
+        proposal_id: u32,
+    ) -> Result<(), RevoraError> {
+        executor.require_auth();
+        Self::require_multisig_owner(&env, &executor)?;
+
+        let key = DataKey::MultisigProposal(proposal_id);
+        let mut proposal: Proposal =
+            env.storage().persistent().get(&key).ok_or(RevoraError::OfferingNotFound)?;
+
+        if proposal.executed {
+            return Err(RevoraError::LimitReached);
+        }
+
+        if env.ledger().timestamp() >= proposal.expiry {
+            return Err(RevoraError::ProposalExpired);
+        }
+
+        let threshold: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigThreshold)
+            .ok_or(RevoraError::NotInitialized)?;
+
+        if proposal.approvals.len() < threshold {
+            return Err(RevoraError::LimitReached);
+        }
+
+        proposal.executed = true;
+        env.storage().persistent().set(&key, &proposal);
+
+        env.events().publish((EVENT_PROPOSAL_EXECUTED, executor), proposal_id);
 
         // Execute the action
         match proposal.action.clone() {
@@ -4514,6 +4553,11 @@ impl RevoraRevenueShare {
                 );
             }
         }
+
+        Ok(())
+    }
+
+} // end impl RevoraRevenueShare (multisig block)
 
 // ─── Storage key types ────────────────────────────────────────────────────────
 
@@ -5143,4 +5187,38 @@ impl RevenueDepositContract {
         });
         fixtures
     }
-}
+} // end get_indexer_fixture_topics
+
+// ── Module declarations ───────────────────────────────────────────────────────
+/// Security Assertions Module
+/// Provides production-grade security validation, input validation, and error handling.
+pub mod security_assertions;
+
+mod test_utils;
+#[cfg(test)]
+mod test;
+#[cfg(test)]
+mod test_auth;
+#[cfg(test)]
+mod test_cross_contract;
+#[cfg(test)]
+mod test_cross_contract_transfer_fail;
+#[cfg(test)]
+mod test_indexer_fixtures;
+#[cfg(test)]
+mod test_namespaces;
+#[cfg(test)]
+mod test_period_id_boundary;
+#[cfg(test)]
+mod test_security_doc_sync;
+#[cfg(test)]
+mod security_assertions_integration_tests;
+#[cfg(test)]
+mod structured_error_tests;
+#[cfg(test)]
+mod chunking_tests;
+pub mod vesting;
+#[cfg(test)]
+mod vesting_test;
+#[cfg(test)]
+mod security_assertions_integration_tests_ext {}
