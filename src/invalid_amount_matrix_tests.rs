@@ -12,11 +12,6 @@
 use crate::{InvestmentConstraintsConfig, RevoraError, RevoraRevenueShare, RevoraRevenueShareClient};
 use soroban_sdk::{symbol_short, testutils::Address as _, token, Address, Env};
 
-fn make_client(env: &Env) -> RevoraRevenueShareClient<'_> {
-    let id = env.register_contract(None, RevoraRevenueShare);
-    RevoraRevenueShareClient::new(env, &id)
-}
-
 fn create_payment_token(env: &Env) -> (Address, Address) {
     let admin = Address::generate(env);
     let token_id = env.register_stellar_asset_contract(admin.clone());
@@ -27,11 +22,12 @@ fn mint(env: &Env, payment_token: &Address, recipient: &Address, amount: i128) {
     token::StellarAssetClient::new(env, payment_token).mint(recipient, &amount);
 }
 
-fn setup_offering() -> (Env, RevoraRevenueShareClient<'static>, Address, Address, Address) {
+fn setup_offering() -> (Env, Address, Address, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
 
-    let client = make_client(&env.clone());
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let issuer = Address::generate(&env);
     let token = Address::generate(&env);
     let payout_asset = Address::generate(&env);
@@ -45,14 +41,15 @@ fn setup_offering() -> (Env, RevoraRevenueShareClient<'static>, Address, Address
         &0,
     );
 
-    (env, client, issuer, token, payout_asset)
+    (env, contract_id, issuer, token, payout_asset)
 }
 
-fn setup_funded_offering() -> (Env, RevoraRevenueShareClient<'static>, Address, Address, Address) {
+fn setup_funded_offering() -> (Env, Address, Address, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
 
-    let client = make_client(&env.clone());
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let issuer = Address::generate(&env);
     let token = Address::generate(&env);
     let (payment_token, _payment_admin) = create_payment_token(&env);
@@ -67,14 +64,14 @@ fn setup_funded_offering() -> (Env, RevoraRevenueShareClient<'static>, Address, 
     );
     mint(&env, &payment_token, &issuer, 1_000_000);
 
-    (env, client, issuer, token, payment_token)
+    (env, contract_id, issuer, token, payment_token)
 }
 
-fn setup_snapshot_offering(
-) -> (Env, RevoraRevenueShareClient<'static>, Address, Address, Address) {
-    let (env, client, issuer, token, payment_token) = setup_funded_offering();
+fn setup_snapshot_offering() -> (Env, Address, Address, Address, Address) {
+    let (env, contract_id, issuer, token, payment_token) = setup_funded_offering();
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
     client.set_snapshot_config(&issuer, &symbol_short!("def"), &token, &true);
-    (env, client, issuer, token, payment_token)
+    (env, contract_id, issuer, token, payment_token)
 }
 
 #[test]
@@ -82,7 +79,8 @@ fn register_offering_rejects_negative_supply_cap_values() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let client = make_client(&env.clone());
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let issuer = Address::generate(&env);
     let token = Address::generate(&env);
     let payout_asset = Address::generate(&env);
@@ -104,7 +102,8 @@ fn register_offering_rejects_negative_supply_cap_values() {
 
 #[test]
 fn report_revenue_rejects_negative_amount_boundaries_without_audit_mutation() {
-    let (_env, client, issuer, token, payout_asset) = setup_offering();
+    let (env, contract_id, issuer, token, payout_asset) = setup_offering();
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
 
     for invalid_amount in [-1_i128, i128::MIN] {
         let result = client.try_report_revenue(
@@ -125,7 +124,8 @@ fn report_revenue_rejects_negative_amount_boundaries_without_audit_mutation() {
 
 #[test]
 fn deposit_revenue_rejects_non_positive_amounts_without_mutating_period_state() {
-    let (_env, client, issuer, token, payment_token) = setup_funded_offering();
+    let (env, contract_id, issuer, token, payment_token) = setup_funded_offering();
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
 
     for invalid_amount in [0_i128, -1_i128, i128::MIN] {
         let result = client.try_deposit_revenue(
@@ -143,7 +143,8 @@ fn deposit_revenue_rejects_non_positive_amounts_without_mutating_period_state() 
 
 #[test]
 fn deposit_revenue_with_snapshot_rejects_non_positive_amounts_without_state_changes() {
-    let (_env, client, issuer, token, payment_token) = setup_snapshot_offering();
+    let (env, contract_id, issuer, token, payment_token) = setup_snapshot_offering();
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
 
     for invalid_amount in [0_i128, -1_i128, i128::MIN] {
         let result = client.try_deposit_revenue_with_snapshot(
@@ -163,7 +164,8 @@ fn deposit_revenue_with_snapshot_rejects_non_positive_amounts_without_state_chan
 
 #[test]
 fn deposit_revenue_with_snapshot_rejects_zero_snapshot_reference_without_state_changes() {
-    let (_env, client, issuer, token, payment_token) = setup_snapshot_offering();
+    let (env, contract_id, issuer, token, payment_token) = setup_snapshot_offering();
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
 
     let result = client.try_deposit_revenue_with_snapshot(
         &issuer,
@@ -182,7 +184,8 @@ fn deposit_revenue_with_snapshot_rejects_zero_snapshot_reference_without_state_c
 
 #[test]
 fn set_investment_constraints_rejects_negative_min_stake() {
-    let (_env, client, issuer, token, _payout_asset) = setup_offering();
+    let (env, contract_id, issuer, token, _payout_asset) = setup_offering();
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
 
     let result =
         client.try_set_investment_constraints(&issuer, &symbol_short!("def"), &token, &-1, &100);
@@ -195,7 +198,8 @@ fn set_investment_constraints_rejects_negative_min_stake() {
 
 #[test]
 fn set_investment_constraints_rejects_negative_max_stake() {
-    let (_env, client, issuer, token, _payout_asset) = setup_offering();
+    let (env, contract_id, issuer, token, _payout_asset) = setup_offering();
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
 
     let result =
         client.try_set_investment_constraints(&issuer, &symbol_short!("def"), &token, &100, &-1);
@@ -208,7 +212,8 @@ fn set_investment_constraints_rejects_negative_max_stake() {
 
 #[test]
 fn set_investment_constraints_rejects_invalid_range_without_overwriting_previous_config() {
-    let (_env, client, issuer, token, _payout_asset) = setup_offering();
+    let (env, contract_id, issuer, token, _payout_asset) = setup_offering();
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
 
     client.set_investment_constraints(&issuer, &symbol_short!("def"), &token, &100, &500);
 
@@ -224,7 +229,8 @@ fn set_investment_constraints_rejects_invalid_range_without_overwriting_previous
 
 #[test]
 fn set_min_revenue_threshold_rejects_negative_transition_without_overwriting_previous_value() {
-    let (_env, client, issuer, token, _payout_asset) = setup_offering();
+    let (env, contract_id, issuer, token, _payout_asset) = setup_offering();
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
 
     client.set_min_revenue_threshold(&issuer, &symbol_short!("def"), &token, &250);
 
@@ -236,4 +242,3 @@ fn set_min_revenue_threshold_rejects_negative_transition_without_overwriting_pre
         250
     );
 }
-
