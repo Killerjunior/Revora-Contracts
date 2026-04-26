@@ -1,0 +1,941 @@
+//! # Report/Claim Window Time Boundary Matrix
+//!
+//! Hardens the reporting and claiming window checks based on ledger time.
+//!
+//! ## Soroban Time Model (for integrators)
+//!
+//! Soroban uses `env.ledger().timestamp()` which returns the Unix timestamp (seconds
+//! since epoch) of the **current ledger's close time**. This value is:
+//! - Set by the Stellar network consensus; not manipulable by individual transactions.
+//! - Monotonically non-decreasing across ledgers (guaranteed by the protocol).
+//! - Available in tests via `env.ledger().with_mut(|l| l.timestamp = T)`.
+//!
+//! Windows are stored as `AccessWindow { start_timestamp: u64, end_timestamp: u64 }`.
+//! The check is **inclusive on both boundaries**:
+//!   `now >= start_timestamp && now <= end_timestamp`
+//!
+//! ## Coverage Matrix
+//!
+//! ### Report Window
+//! | Scenario | now vs window | Expected |
+//! |----------|--------------|----------|
+//! | No window set | any | OK (always open) |
+//! | now < start | before | ReportingWindowClosed |
+//! | now == start | at start | OK (inclusive) |
+//! | now in (start, end) | inside | OK |
+//! | now == end | at end | OK (inclusive) |
+//! | now > end | after | ReportingWindowClosed |
+//! | start == end (zero-width) | now == start | OK |
+//! | start == end (zero-width) | now != start | ReportingWindowClosed |
+//! | window reconfigured mid-flight | new window excludes now | ReportingWindowClosed |
+//! | window reconfigured mid-flight | new window includes now | OK |
+//!
+//! ### Claim Window
+//! | Scenario | now vs window | Expected |
+//! |----------|--------------|----------|
+//! | No window set | any | OK (always open) |
+//! | now < start | before | ClaimWindowClosed |
+//! | now == start | at start | OK (inclusive) |
+//! | now in (start, end) | inside | OK |
+//! | now == end | at end | OK (inclusive) |
+//! | now > end | after | ClaimWindowClosed |
+//! | start == end (zero-width) | now == start | OK |
+//! | start == end (zero-width) | now != start | ClaimWindowClosed |
+//! | window reconfigured mid-flight | new window excludes now | ClaimWindowClosed |
+//! | window reconfigured mid-flight | new window includes now | OK |
+//!
+//! ### Window Validation (set_report_window / set_claim_window)
+//! | start vs end | Expected |
+//! |-------------|----------|
+//! | start < end | OK |
+//! | start == end | OK (zero-width, single-second window) |
+//! | start > end | LimitReached |
+//!
+//! ## Security / Risk Notes
+//!
+//! - **Reconfiguration race**: An issuer can change a window while a holder's claim
+//!   transaction is in-flight. The contract applies the window that is active at the
+//!   ledger that closes the transaction — there is no "snapshot" of the window at
+//!   submission time. Integrators must account for this.
+//! - **Zero-width windows**: A window where `start == end` is valid and creates a
+//!   single-second eligibility slot. This is intentional but operationally fragile;
+//!   issuers should prefer windows with meaningful duration.
+//! - **No deposit window**: `deposit_revenue` has no time-window guard. Only
+//!   `report_revenue` (reporting window) and `claim` (claiming window) are gated.
+//! - **Claim delay is orthogonal**: The per-offering `ClaimDelaySecs` is checked
+//!   *inside* the claim loop per period, independently of the claim window. Both
+//!   must pass for a period to be claimable.
+//! - **Timestamp source**: `env.ledger().timestamp()` is the only time source used.
+//!   Wall-clock time or block numbers are NOT used.
+
+#![cfg(test)]
+#![allow(unused_imports)]
+
+use crate::{RevoraError, RevoraRevenueShare, RevoraRevenueShareClient};
+use soroban_sdk::{
+    symbol_short,
+    testutils::{Address as _, Ledger as _},
+    token, Address, Env,
+};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn make_client(env: &Env) -> RevoraRevenueShareClient<'_> {
+    let id = env.register_contract(None, RevoraRevenueShare);
+    RevoraRevenueShareClient::new(env, &id)
+}
+
+fn create_payment_token(env: &Env) -> (Address, Address) {
+    let admin = Address::generate(env);
+    let token_id = env.register_stellar_asset_contract(admin.clone());
+    (token_id, admin)
+}
+
+fn mint(env: &Env, token: &Address, to: &Address, amount: i128) {
+    token::StellarAssetClient::new(env, token).mint(to, &amount);
+}
+
+fn set_time(env: &Env, ts: u64) {
+    env.ledger().with_mut(|l| l.timestamp = ts);
+}
+
+/// Full setup: env + client + registered offering + funded issuer + holder with 100% share.
+/// Returns (env, client, issuer, offering_token, payment_token, holder).
+fn setup_with_holder() -> (
+    Env,
+    RevoraRevenueShareClient<'static>,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let offering_token = Address::generate(&env);
+    let (payment_token, _) = create_payment_token(&env);
+    let holder = Address::generate(&env);
+
+    client.register_offering(
+        &issuer,
+        &symbol_short!("ns"),
+        &offering_token,
+        &10_000, // 100% share pool
+        &payment_token,
+        &0,
+    );
+    mint(&env, &payment_token, &issuer, 10_000_000);
+    client.set_holder_share(&issuer, &symbol_short!("ns"), &offering_token, &holder, &10_000);
+
+    (env, client, issuer, offering_token, payment_token, holder)
+}
+
+/// Deposit one period of revenue and return the period_id used.
+fn deposit_period(
+    env: &Env,
+    client: &RevoraRevenueShareClient,
+    issuer: &Address,
+    token: &Address,
+    payment_token: &Address,
+    period_id: u64,
+    amount: i128,
+) {
+    client
+        .deposit_revenue(issuer, &symbol_short!("ns"), token, payment_token, &amount, &period_id)
+        .unwrap();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 1 — Report Window Boundary Matrix
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// No report window set → report_revenue always succeeds regardless of timestamp.
+#[test]
+fn report_window_unset_always_open() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    // Verify no window is stored
+    assert!(client.get_report_window(&issuer, &symbol_short!("ns"), &token).is_none());
+
+    // Any timestamp — should succeed
+    for ts in [0u64, 1, 1_000, u64::MAX / 2] {
+        set_time(&env, ts);
+        let r = client.try_report_revenue(
+            &issuer,
+            &symbol_short!("ns"),
+            &token,
+            &token,
+            &100,
+            &(ts + 1), // unique period_id per iteration
+            &false,
+        );
+        assert!(r.is_ok(), "expected OK at ts={ts}, got {r:?}");
+    }
+}
+
+/// now < start → ReportingWindowClosed.
+#[test]
+fn report_window_before_start_is_closed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    // Window: [1000, 2000]
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token, &1_000, &2_000).unwrap();
+
+    // now = 999 (one second before start)
+    set_time(&env, 999);
+    let r = client.try_report_revenue(
+        &issuer, &symbol_short!("ns"), &token, &token, &100, &1, &false,
+    );
+    assert_eq!(r, Err(Ok(RevoraError::ReportingWindowClosed)));
+}
+
+/// now == start → OK (start boundary is inclusive).
+#[test]
+fn report_window_at_start_is_open_inclusive() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token, &1_000, &2_000).unwrap();
+
+    set_time(&env, 1_000); // exactly at start
+    let r = client.try_report_revenue(
+        &issuer, &symbol_short!("ns"), &token, &token, &100, &1, &false,
+    );
+    assert!(r.is_ok(), "start boundary must be inclusive, got {r:?}");
+}
+
+/// now strictly inside (start, end) → OK.
+#[test]
+fn report_window_inside_is_open() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token, &1_000, &2_000).unwrap();
+
+    set_time(&env, 1_500);
+    let r = client.try_report_revenue(
+        &issuer, &symbol_short!("ns"), &token, &token, &100, &1, &false,
+    );
+    assert!(r.is_ok(), "mid-window must be open, got {r:?}");
+}
+
+/// now == end → OK (end boundary is inclusive).
+#[test]
+fn report_window_at_end_is_open_inclusive() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token, &1_000, &2_000).unwrap();
+
+    set_time(&env, 2_000); // exactly at end
+    let r = client.try_report_revenue(
+        &issuer, &symbol_short!("ns"), &token, &token, &100, &1, &false,
+    );
+    assert!(r.is_ok(), "end boundary must be inclusive, got {r:?}");
+}
+
+/// now > end → ReportingWindowClosed.
+#[test]
+fn report_window_after_end_is_closed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token, &1_000, &2_000).unwrap();
+
+    set_time(&env, 2_001); // one second after end
+    let r = client.try_report_revenue(
+        &issuer, &symbol_short!("ns"), &token, &token, &100, &1, &false,
+    );
+    assert_eq!(r, Err(Ok(RevoraError::ReportingWindowClosed)));
+}
+
+/// Zero-width window (start == end): only the exact timestamp is open.
+#[test]
+fn report_window_zero_width_open_at_exact_timestamp() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    // start == end: single-second window at T=5000
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token, &5_000, &5_000).unwrap();
+
+    set_time(&env, 5_000);
+    let r = client.try_report_revenue(
+        &issuer, &symbol_short!("ns"), &token, &token, &100, &1, &false,
+    );
+    assert!(r.is_ok(), "zero-width window must be open at exact timestamp, got {r:?}");
+}
+
+/// Zero-width window: one second before is closed.
+#[test]
+fn report_window_zero_width_closed_before() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token, &5_000, &5_000).unwrap();
+
+    set_time(&env, 4_999);
+    let r = client.try_report_revenue(
+        &issuer, &symbol_short!("ns"), &token, &token, &100, &1, &false,
+    );
+    assert_eq!(r, Err(Ok(RevoraError::ReportingWindowClosed)));
+}
+
+/// Zero-width window: one second after is closed.
+#[test]
+fn report_window_zero_width_closed_after() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token, &5_000, &5_000).unwrap();
+
+    set_time(&env, 5_001);
+    let r = client.try_report_revenue(
+        &issuer, &symbol_short!("ns"), &token, &token, &100, &1, &false,
+    );
+    assert_eq!(r, Err(Ok(RevoraError::ReportingWindowClosed)));
+}
+
+/// Reconfiguring the window mid-flight to exclude the current time closes reporting.
+#[test]
+fn report_window_reconfigured_to_exclude_now_closes_reporting() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    // Initial window: [1000, 3000]; now = 2000 → open
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token, &1_000, &3_000).unwrap();
+    set_time(&env, 2_000);
+    client
+        .report_revenue(&issuer, &symbol_short!("ns"), &token, &token, &100, &1, &false)
+        .unwrap();
+
+    // Issuer reconfigures window to [4000, 5000]; now = 2000 → closed
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token, &4_000, &5_000).unwrap();
+    let r = client.try_report_revenue(
+        &issuer, &symbol_short!("ns"), &token, &token, &100, &2, &false,
+    );
+    assert_eq!(r, Err(Ok(RevoraError::ReportingWindowClosed)));
+}
+
+/// Reconfiguring the window mid-flight to include the current time opens reporting.
+#[test]
+fn report_window_reconfigured_to_include_now_opens_reporting() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    // Initial window: [4000, 5000]; now = 2000 → closed
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token, &4_000, &5_000).unwrap();
+    set_time(&env, 2_000);
+    let r = client.try_report_revenue(
+        &issuer, &symbol_short!("ns"), &token, &token, &100, &1, &false,
+    );
+    assert_eq!(r, Err(Ok(RevoraError::ReportingWindowClosed)));
+
+    // Issuer reconfigures to [1000, 3000]; now = 2000 → open
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token, &1_000, &3_000).unwrap();
+    let r2 = client.try_report_revenue(
+        &issuer, &symbol_short!("ns"), &token, &token, &100, &1, &false,
+    );
+    assert!(r2.is_ok(), "reconfigured window should now be open, got {r2:?}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 2 — Claim Window Boundary Matrix
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// No claim window set → claim always succeeds (window-wise) regardless of timestamp.
+#[test]
+fn claim_window_unset_always_open() {
+    let (env, client, issuer, token, payment_token, holder) = setup_with_holder();
+
+    // Verify no window is stored
+    assert!(client.get_claim_window(&issuer, &symbol_short!("ns"), &token).is_none());
+
+    set_time(&env, 1_000);
+    deposit_period(&env, &client, &issuer, &token, &payment_token, 1, 100_000);
+
+    // Claim at an arbitrary timestamp — should succeed
+    set_time(&env, 999_999);
+    let payout = client.claim(&holder, &issuer, &symbol_short!("ns"), &token, &50);
+    assert_eq!(payout, 100_000);
+}
+
+/// now < start → ClaimWindowClosed.
+#[test]
+fn claim_window_before_start_is_closed() {
+    let (env, client, issuer, token, payment_token, holder) = setup_with_holder();
+
+    set_time(&env, 500);
+    deposit_period(&env, &client, &issuer, &token, &payment_token, 1, 100_000);
+
+    // Window: [1000, 2000]; now = 999
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &1_000, &2_000).unwrap();
+    set_time(&env, 999);
+    let r = client.try_claim(&holder, &issuer, &symbol_short!("ns"), &token, &50);
+    assert_eq!(r, Err(Ok(RevoraError::ClaimWindowClosed)));
+}
+
+/// now == start → OK (start boundary is inclusive).
+#[test]
+fn claim_window_at_start_is_open_inclusive() {
+    let (env, client, issuer, token, payment_token, holder) = setup_with_holder();
+
+    set_time(&env, 500);
+    deposit_period(&env, &client, &issuer, &token, &payment_token, 1, 100_000);
+
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &1_000, &2_000).unwrap();
+    set_time(&env, 1_000); // exactly at start
+    let r = client.try_claim(&holder, &issuer, &symbol_short!("ns"), &token, &50);
+    assert!(r.is_ok(), "start boundary must be inclusive, got {r:?}");
+}
+
+/// now strictly inside (start, end) → OK.
+#[test]
+fn claim_window_inside_is_open() {
+    let (env, client, issuer, token, payment_token, holder) = setup_with_holder();
+
+    set_time(&env, 500);
+    deposit_period(&env, &client, &issuer, &token, &payment_token, 1, 100_000);
+
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &1_000, &2_000).unwrap();
+    set_time(&env, 1_500);
+    let r = client.try_claim(&holder, &issuer, &symbol_short!("ns"), &token, &50);
+    assert!(r.is_ok(), "mid-window must be open, got {r:?}");
+}
+
+/// now == end → OK (end boundary is inclusive).
+#[test]
+fn claim_window_at_end_is_open_inclusive() {
+    let (env, client, issuer, token, payment_token, holder) = setup_with_holder();
+
+    set_time(&env, 500);
+    deposit_period(&env, &client, &issuer, &token, &payment_token, 1, 100_000);
+
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &1_000, &2_000).unwrap();
+    set_time(&env, 2_000); // exactly at end
+    let r = client.try_claim(&holder, &issuer, &symbol_short!("ns"), &token, &50);
+    assert!(r.is_ok(), "end boundary must be inclusive, got {r:?}");
+}
+
+/// now > end → ClaimWindowClosed.
+#[test]
+fn claim_window_after_end_is_closed() {
+    let (env, client, issuer, token, payment_token, holder) = setup_with_holder();
+
+    set_time(&env, 500);
+    deposit_period(&env, &client, &issuer, &token, &payment_token, 1, 100_000);
+
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &1_000, &2_000).unwrap();
+    set_time(&env, 2_001); // one second after end
+    let r = client.try_claim(&holder, &issuer, &symbol_short!("ns"), &token, &50);
+    assert_eq!(r, Err(Ok(RevoraError::ClaimWindowClosed)));
+}
+
+/// Zero-width claim window: only the exact timestamp is open.
+#[test]
+fn claim_window_zero_width_open_at_exact_timestamp() {
+    let (env, client, issuer, token, payment_token, holder) = setup_with_holder();
+
+    set_time(&env, 500);
+    deposit_period(&env, &client, &issuer, &token, &payment_token, 1, 100_000);
+
+    // start == end at T=5000
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &5_000, &5_000).unwrap();
+    set_time(&env, 5_000);
+    let r = client.try_claim(&holder, &issuer, &symbol_short!("ns"), &token, &50);
+    assert!(r.is_ok(), "zero-width window must be open at exact timestamp, got {r:?}");
+}
+
+/// Zero-width claim window: one second before is closed.
+#[test]
+fn claim_window_zero_width_closed_before() {
+    let (env, client, issuer, token, payment_token, holder) = setup_with_holder();
+
+    set_time(&env, 500);
+    deposit_period(&env, &client, &issuer, &token, &payment_token, 1, 100_000);
+
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &5_000, &5_000).unwrap();
+    set_time(&env, 4_999);
+    let r = client.try_claim(&holder, &issuer, &symbol_short!("ns"), &token, &50);
+    assert_eq!(r, Err(Ok(RevoraError::ClaimWindowClosed)));
+}
+
+/// Zero-width claim window: one second after is closed.
+#[test]
+fn claim_window_zero_width_closed_after() {
+    let (env, client, issuer, token, payment_token, holder) = setup_with_holder();
+
+    set_time(&env, 500);
+    deposit_period(&env, &client, &issuer, &token, &payment_token, 1, 100_000);
+
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &5_000, &5_000).unwrap();
+    set_time(&env, 5_001);
+    let r = client.try_claim(&holder, &issuer, &symbol_short!("ns"), &token, &50);
+    assert_eq!(r, Err(Ok(RevoraError::ClaimWindowClosed)));
+}
+
+/// Reconfiguring the claim window mid-flight to exclude the current time closes claiming.
+#[test]
+fn claim_window_reconfigured_to_exclude_now_closes_claiming() {
+    let (env, client, issuer, token, payment_token, holder) = setup_with_holder();
+
+    set_time(&env, 500);
+    deposit_period(&env, &client, &issuer, &token, &payment_token, 1, 100_000);
+    deposit_period(&env, &client, &issuer, &token, &payment_token, 2, 50_000);
+
+    // Initial window: [1000, 3000]; now = 2000 → open; claim period 1
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &1_000, &3_000).unwrap();
+    set_time(&env, 2_000);
+    client.claim(&holder, &issuer, &symbol_short!("ns"), &token, &1).unwrap();
+
+    // Issuer reconfigures window to [4000, 5000]; now = 2000 → closed
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &4_000, &5_000).unwrap();
+    let r = client.try_claim(&holder, &issuer, &symbol_short!("ns"), &token, &50);
+    assert_eq!(r, Err(Ok(RevoraError::ClaimWindowClosed)));
+}
+
+/// Reconfiguring the claim window mid-flight to include the current time opens claiming.
+#[test]
+fn claim_window_reconfigured_to_include_now_opens_claiming() {
+    let (env, client, issuer, token, payment_token, holder) = setup_with_holder();
+
+    set_time(&env, 500);
+    deposit_period(&env, &client, &issuer, &token, &payment_token, 1, 100_000);
+
+    // Initial window: [4000, 5000]; now = 2000 → closed
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &4_000, &5_000).unwrap();
+    set_time(&env, 2_000);
+    let r = client.try_claim(&holder, &issuer, &symbol_short!("ns"), &token, &50);
+    assert_eq!(r, Err(Ok(RevoraError::ClaimWindowClosed)));
+
+    // Issuer reconfigures to [1000, 3000]; now = 2000 → open
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &1_000, &3_000).unwrap();
+    let r2 = client.try_claim(&holder, &issuer, &symbol_short!("ns"), &token, &50);
+    assert!(r2.is_ok(), "reconfigured window should now be open, got {r2:?}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 3 — Window Validation (set_report_window / set_claim_window)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// set_report_window with start < end is accepted.
+#[test]
+fn set_report_window_valid_range_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    let r = client.try_set_report_window(&issuer, &symbol_short!("ns"), &token, &1_000, &2_000);
+    assert!(r.is_ok());
+
+    let w = client.get_report_window(&issuer, &symbol_short!("ns"), &token).unwrap();
+    assert_eq!(w.start_timestamp, 1_000);
+    assert_eq!(w.end_timestamp, 2_000);
+}
+
+/// set_report_window with start == end (zero-width) is accepted.
+#[test]
+fn set_report_window_zero_width_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    let r = client.try_set_report_window(&issuer, &symbol_short!("ns"), &token, &5_000, &5_000);
+    assert!(r.is_ok(), "zero-width window must be accepted, got {r:?}");
+}
+
+/// set_report_window with start > end is rejected with LimitReached.
+#[test]
+fn set_report_window_inverted_range_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    let r = client.try_set_report_window(&issuer, &symbol_short!("ns"), &token, &2_000, &1_000);
+    assert_eq!(r, Err(Ok(RevoraError::LimitReached)));
+
+    // No window should have been stored
+    assert!(client.get_report_window(&issuer, &symbol_short!("ns"), &token).is_none());
+}
+
+/// set_claim_window with start < end is accepted.
+#[test]
+fn set_claim_window_valid_range_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    let r = client.try_set_claim_window(&issuer, &symbol_short!("ns"), &token, &1_000, &2_000);
+    assert!(r.is_ok());
+
+    let w = client.get_claim_window(&issuer, &symbol_short!("ns"), &token).unwrap();
+    assert_eq!(w.start_timestamp, 1_000);
+    assert_eq!(w.end_timestamp, 2_000);
+}
+
+/// set_claim_window with start == end (zero-width) is accepted.
+#[test]
+fn set_claim_window_zero_width_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    let r = client.try_set_claim_window(&issuer, &symbol_short!("ns"), &token, &5_000, &5_000);
+    assert!(r.is_ok(), "zero-width window must be accepted, got {r:?}");
+}
+
+/// set_claim_window with start > end is rejected with LimitReached.
+#[test]
+fn set_claim_window_inverted_range_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    let r = client.try_set_claim_window(&issuer, &symbol_short!("ns"), &token, &2_000, &1_000);
+    assert_eq!(r, Err(Ok(RevoraError::LimitReached)));
+
+    assert!(client.get_claim_window(&issuer, &symbol_short!("ns"), &token).is_none());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 4 — deposit_revenue has NO time-window gate
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// deposit_revenue succeeds regardless of any report or claim window configuration.
+/// This asserts the documented semantic: only report_revenue and claim are window-gated.
+#[test]
+fn deposit_revenue_ignores_report_and_claim_windows() {
+    let (env, client, issuer, token, payment_token, _holder) = setup_with_holder();
+
+    // Set both windows to a future range so "now" is outside both
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token, &9_000, &10_000).unwrap();
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &9_000, &10_000).unwrap();
+
+    // now = 1000, well outside both windows
+    set_time(&env, 1_000);
+
+    let r = client.try_deposit_revenue(
+        &issuer, &symbol_short!("ns"), &token, &payment_token, &100_000, &1,
+    );
+    assert!(r.is_ok(), "deposit_revenue must not be gated by report/claim windows, got {r:?}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 5 — Claim delay is orthogonal to claim window
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Claim window open + delay not elapsed → ClaimDelayNotElapsed (not ClaimWindowClosed).
+/// Confirms the two mechanisms are independent and delay is checked per-period inside the loop.
+#[test]
+fn claim_window_open_but_delay_not_elapsed_returns_delay_error() {
+    let (env, client, issuer, token, payment_token, holder) = setup_with_holder();
+
+    // Deposit at T=1000
+    set_time(&env, 1_000);
+    deposit_period(&env, &client, &issuer, &token, &payment_token, 1, 100_000);
+
+    // Set 500s delay and a claim window that is open at T=1200
+    client.set_claim_delay(&issuer, &symbol_short!("ns"), &token, &500).unwrap();
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &1_100, &2_000).unwrap();
+
+    // T=1200: window is open, but delay requires T >= 1000+500=1500
+    set_time(&env, 1_200);
+    let r = client.try_claim(&holder, &issuer, &symbol_short!("ns"), &token, &50);
+    assert_eq!(r, Err(Ok(RevoraError::ClaimDelayNotElapsed)));
+}
+
+/// Claim window open + delay elapsed → claim succeeds.
+#[test]
+fn claim_window_open_and_delay_elapsed_succeeds() {
+    let (env, client, issuer, token, payment_token, holder) = setup_with_holder();
+
+    set_time(&env, 1_000);
+    deposit_period(&env, &client, &issuer, &token, &payment_token, 1, 100_000);
+
+    client.set_claim_delay(&issuer, &symbol_short!("ns"), &token, &500).unwrap();
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &1_100, &3_000).unwrap();
+
+    // T=1500: window open AND delay elapsed (1000+500=1500)
+    set_time(&env, 1_500);
+    let payout = client.claim(&holder, &issuer, &symbol_short!("ns"), &token, &50);
+    assert_eq!(payout, 100_000);
+}
+
+/// Claim window closed + delay elapsed → ClaimWindowClosed (window check runs first).
+#[test]
+fn claim_window_closed_even_if_delay_elapsed() {
+    let (env, client, issuer, token, payment_token, holder) = setup_with_holder();
+
+    set_time(&env, 1_000);
+    deposit_period(&env, &client, &issuer, &token, &payment_token, 1, 100_000);
+
+    client.set_claim_delay(&issuer, &symbol_short!("ns"), &token, &100).unwrap();
+    // Window is in the past: [500, 900]
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &500, &900).unwrap();
+
+    // T=1200: delay elapsed (1000+100=1100 <= 1200) but window is closed
+    set_time(&env, 1_200);
+    let r = client.try_claim(&holder, &issuer, &symbol_short!("ns"), &token, &50);
+    assert_eq!(r, Err(Ok(RevoraError::ClaimWindowClosed)));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 6 — Window isolation across offerings
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A report window on offering A must not affect offering B.
+#[test]
+fn report_window_is_scoped_per_offering() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token_a = Address::generate(&env);
+    let token_b = Address::generate(&env);
+
+    client.register_offering(&issuer, &symbol_short!("ns"), &token_a, &1_000, &token_a, &0);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token_b, &1_000, &token_b, &0);
+
+    // Close offering A's report window; leave B's unset (always open)
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token_a, &5_000, &6_000).unwrap();
+
+    set_time(&env, 1_000); // outside A's window
+
+    // A is closed
+    let r_a = client.try_report_revenue(
+        &issuer, &symbol_short!("ns"), &token_a, &token_a, &100, &1, &false,
+    );
+    assert_eq!(r_a, Err(Ok(RevoraError::ReportingWindowClosed)));
+
+    // B is open (no window set)
+    let r_b = client.try_report_revenue(
+        &issuer, &symbol_short!("ns"), &token_b, &token_b, &100, &1, &false,
+    );
+    assert!(r_b.is_ok(), "offering B must be unaffected by offering A's window, got {r_b:?}");
+}
+
+/// A claim window on offering A must not affect offering B.
+#[test]
+fn claim_window_is_scoped_per_offering() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token_a = Address::generate(&env);
+    let token_b = Address::generate(&env);
+    let (payment_token, _) = create_payment_token(&env);
+    let holder = Address::generate(&env);
+
+    client.register_offering(
+        &issuer, &symbol_short!("ns"), &token_a, &10_000, &payment_token, &0,
+    );
+    client.register_offering(
+        &issuer, &symbol_short!("ns"), &token_b, &10_000, &payment_token, &0,
+    );
+    mint(&env, &payment_token, &issuer, 10_000_000);
+    client.set_holder_share(&issuer, &symbol_short!("ns"), &token_a, &holder, &10_000);
+    client.set_holder_share(&issuer, &symbol_short!("ns"), &token_b, &holder, &10_000);
+
+    set_time(&env, 500);
+    client
+        .deposit_revenue(&issuer, &symbol_short!("ns"), &token_a, &payment_token, &100_000, &1)
+        .unwrap();
+    client
+        .deposit_revenue(&issuer, &symbol_short!("ns"), &token_b, &payment_token, &100_000, &1)
+        .unwrap();
+
+    // Close A's claim window; leave B's unset
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token_a, &5_000, &6_000).unwrap();
+
+    set_time(&env, 1_000); // outside A's window
+
+    let r_a = client.try_claim(&holder, &issuer, &symbol_short!("ns"), &token_a, &50);
+    assert_eq!(r_a, Err(Ok(RevoraError::ClaimWindowClosed)));
+
+    let r_b = client.try_claim(&holder, &issuer, &symbol_short!("ns"), &token_b, &50);
+    assert!(r_b.is_ok(), "offering B must be unaffected by offering A's window, got {r_b:?}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 7 — Event emission on window set
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// set_report_window emits an event.
+#[test]
+fn set_report_window_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    let before = env.events().all().len();
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token, &1_000, &2_000).unwrap();
+    assert!(
+        env.events().all().len() > before,
+        "set_report_window must emit at least one event"
+    );
+}
+
+/// set_claim_window emits an event.
+#[test]
+fn set_claim_window_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    let before = env.events().all().len();
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &1_000, &2_000).unwrap();
+    assert!(
+        env.events().all().len() > before,
+        "set_claim_window must emit at least one event"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 8 — get_report_window / get_claim_window read-back
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// get_report_window returns None when no window has been set.
+#[test]
+fn get_report_window_returns_none_when_unset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    assert!(client.get_report_window(&issuer, &symbol_short!("ns"), &token).is_none());
+}
+
+/// get_claim_window returns None when no window has been set.
+#[test]
+fn get_claim_window_returns_none_when_unset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    assert!(client.get_claim_window(&issuer, &symbol_short!("ns"), &token).is_none());
+}
+
+/// get_report_window returns the correct window after set.
+#[test]
+fn get_report_window_returns_correct_values() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token, &1_234, &5_678).unwrap();
+    let w = client.get_report_window(&issuer, &symbol_short!("ns"), &token).unwrap();
+    assert_eq!(w.start_timestamp, 1_234);
+    assert_eq!(w.end_timestamp, 5_678);
+}
+
+/// get_claim_window returns the correct window after set.
+#[test]
+fn get_claim_window_returns_correct_values() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    client.set_claim_window(&issuer, &symbol_short!("ns"), &token, &9_000, &9_999).unwrap();
+    let w = client.get_claim_window(&issuer, &symbol_short!("ns"), &token).unwrap();
+    assert_eq!(w.start_timestamp, 9_000);
+    assert_eq!(w.end_timestamp, 9_999);
+}
+
+/// Overwriting a window replaces the stored values.
+#[test]
+fn set_report_window_overwrites_previous() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("ns"), &token, &1_000, &token, &0);
+
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token, &1_000, &2_000).unwrap();
+    client.set_report_window(&issuer, &symbol_short!("ns"), &token, &3_000, &4_000).unwrap();
+
+    let w = client.get_report_window(&issuer, &symbol_short!("ns"), &token).unwrap();
+    assert_eq!(w.start_timestamp, 3_000);
+    assert_eq!(w.end_timestamp, 4_000);
+}

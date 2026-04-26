@@ -16,7 +16,7 @@ Status: 0/6 Complete
 - [ ] check_invariants oracle: payout conservation/blacklist/concentration/pause/multisig/pagination
 - [ ] prop_period_ordering (strictly increasing)
 - [ ] prop_blacklist_enforcement (claims=0)
-- [ ] prop_concentration_limits (enforce blocks)
+- [x] prop_concentration_limits (enforce blocks)
 - [ ] prop_pagination_stability (deterministic register→paginate)
 - [ ] prop_multisig_threshold (below threshold fails)
 - [ ] prop_pause_safety (mutations panic post-pause)

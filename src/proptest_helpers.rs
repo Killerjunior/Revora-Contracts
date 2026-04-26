@@ -120,6 +120,8 @@ pub enum TestOperation {
     BlacklistRemove { target_index: u8 },
     /// `set_concentration_limit(issuer, namespace, token, max_bps, enforce)`
     SetConcentrationLimit { max_bps: u32, enforce: bool },
+    /// `report_concentration(issuer, namespace, token, concentration_bps)`
+    ReportConcentration { concentration_bps: u32 },
     /// `freeze()` — admin-only global freeze
     Freeze,
     /// `set_claim_delay(issuer, namespace, token, delay_secs)`
@@ -173,6 +175,11 @@ pub fn arb_set_concentration_limit() -> impl Strategy<Value = TestOperation> {
         .prop_map(|(max_bps, enforce)| TestOperation::SetConcentrationLimit { max_bps, enforce })
 }
 
+/// Strategy for a single `ReportConcentration` operation.
+pub fn arb_report_concentration() -> impl Strategy<Value = TestOperation> {
+    arb_valid_bps().prop_map(|concentration_bps| TestOperation::ReportConcentration { concentration_bps })
+}
+
 /// Strategy for any single valid operation (uniform distribution).
 pub fn arb_any_operation() -> impl Strategy<Value = TestOperation> {
     prop_oneof![
@@ -183,6 +190,7 @@ pub fn arb_any_operation() -> impl Strategy<Value = TestOperation> {
         arb_blacklist_add(),
         arb_blacklist_remove(),
         arb_set_concentration_limit(),
+        arb_report_concentration(),
         Just(TestOperation::Freeze),
         (0u64..=3600u64).prop_map(|d| TestOperation::SetClaimDelay { delay_secs: d }),
     ]
