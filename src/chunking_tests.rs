@@ -1,5 +1,7 @@
 #![cfg(test)]
-#![allow(dead_code, unused_variables, unused_imports)]
+// `make_client` and `setup` are shared helpers; not every test uses every helper.
+// Suppress only dead_code for helpers, not all warnings globally.
+#![allow(dead_code)]
 
 use crate::{RevoraRevenueShare, RevoraRevenueShareClient};
 use soroban_sdk::{symbol_short, testutils::Address as _, token, Address, Env, Vec};
@@ -79,6 +81,104 @@ fn get_revenue_range_chunk_matches_full_sum() {
     }
 
     assert_eq!(full, acc);
+}
+
+#[test]
+fn get_revenue_range_chunk_inverted_range_returns_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client = make_client(&env);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("def"), &token, &1000u32, &token, &0i128);
+
+    // inverted range: from > to
+    let (sum, next) = client.get_revenue_range_chunk(&issuer, &symbol_short!("def"), &token, &10u64, &1u64, &5u32);
+    assert_eq!(sum, 0);
+    assert!(next.is_none());
+}
+
+#[test]
+fn get_revenue_range_chunk_cap_clamps_and_returns_next_start() {
+    // Ensure that max_periods of 0 is normalized to the contract cap (MAX_CHUNK_PERIODS)
+    // We insert 201 periods with value 1 each; with a cap of 200 the first chunk should
+    // return a sum of 200 and next_start = Some(201).
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client = make_client(&env);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("def"), &token, &1000u32, &token, &0i128);
+
+    // Report revenue for periods 1..=201 with amount 1 each
+    for p in 1u64..=201u64 {
+        client.report_revenue(&issuer, &symbol_short!("def"), &token, &token, &1i128, &p, &false);
+    }
+
+    let (partial, next) = client.get_revenue_range_chunk(
+        &issuer,
+        &symbol_short!("def"),
+        &token,
+        &1u64,
+        &201u64,
+        &0u32, // request 0 => should clamp to MAX_CHUNK_PERIODS (200)
+    );
+
+    assert_eq!(partial, 200i128);
+    assert_eq!(next, Some(201u64));
+}
+
+#[test]
+fn get_revenue_range_chunk_chunked_iteration_off_by_one_sequence() {
+    // Verify that repeated chunked calls produce the expected next_start sequence
+    // For 5 periods and chunk size 2: nexts should be Some(3), Some(5), None
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client = make_client(&env);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("def"), &token, &1000u32, &token, &0i128);
+
+    // Report revenue for periods 1..=5 with increasing amounts for easier validation
+    for p in 1u64..=5u64 {
+        client.report_revenue(&issuer, &symbol_short!("def"), &token, &token, &(p as i128), &p, &false);
+    }
+
+    let mut cursor = 1u64;
+    let mut acc: i128 = 0;
+    let mut seen_nexts: Vec<u64> = Vec::new(&env);
+    loop {
+        let (partial, next) = client.get_revenue_range_chunk(
+            &issuer,
+            &symbol_short!("def"),
+            &token,
+            &cursor,
+            &5u64,
+            &2u32,
+        );
+        acc += partial;
+        if let Some(n) = next {
+            seen_nexts.push_back(n);
+            cursor = n;
+        } else {
+            break;
+        }
+    }
+
+    // Full sum of 1+2+3+4+5 = 15
+    let full = client.get_revenue_range(&issuer, &symbol_short!("def"), &token, &1u64, &5u64);
+    assert_eq!(full, acc);
+
+    // next sequence should be [3,5]
+    assert_eq!(seen_nexts.len(), 2);
+    assert_eq!(seen_nexts.get(0).unwrap(), 3u64);
+    assert_eq!(seen_nexts.get(1).unwrap(), 5u64);
 }
 
 #[test]
