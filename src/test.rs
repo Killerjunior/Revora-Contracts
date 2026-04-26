@@ -4071,6 +4071,191 @@ fn multisig_init_empty_owners_fails() {
 }
 
 #[test]
+fn multisig_init_zero_duration_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let caller = Address::generate(&env);
+    let issuer = caller.clone();
+
+    let mut owners = Vec::new(&env);
+    owners.push_back(Address::generate(&env));
+    // duration=0 should fail
+    let r = client.try_init_multisig(&caller, &owners, &1, &0);
+    assert!(r.is_err());
+}
+
+#[test]
+fn multisig_init_duration_exceeds_max_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let caller = Address::generate(&env);
+    let issuer = caller.clone();
+
+    let mut owners = Vec::new(&env);
+    owners.push_back(Address::generate(&env));
+    // duration > 365 days (31,536,000 seconds) should fail
+    let excessive_duration = 365 * 24 * 60 * 60 + 1; // 31,536,001 seconds
+    let r = client.try_init_multisig(&caller, &owners, &1, &excessive_duration);
+    assert!(r.is_err());
+}
+
+#[test]
+fn multisig_init_valid_duration_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let caller = Address::generate(&env);
+    let issuer = caller.clone();
+
+    let mut owners = Vec::new(&env);
+    let owner1 = Address::generate(&env);
+    owners.push_back(owner1.clone());
+
+    // duration=86400 (1 day) should succeed
+    client.init_multisig(&caller, &owners, &1, &86400);
+    assert_eq!(client.get_multisig_threshold(), Some(1));
+
+    // Verify we can propose an action (which requires duration to be set)
+    let proposal_id = client.propose_action(&owner1, &ProposalAction::Freeze);
+    assert!(proposal_id == 0);
+}
+
+#[test]
+fn multisig_init_max_owners_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let caller = Address::generate(&env);
+    let issuer = caller.clone();
+
+    // Create exactly 20 owners (MAX_MULTISIG_OWNERS)
+    let mut owners = Vec::new(&env);
+    for _ in 0..20 {
+        owners.push_back(Address::generate(&env));
+    }
+
+    // threshold=11 (majority), duration=86400
+    client.init_multisig(&caller, &owners, &11, &86400);
+    assert_eq!(client.get_multisig_threshold(), Some(11));
+    assert_eq!(client.get_multisig_owners().len(), 20);
+}
+
+#[test]
+fn multisig_init_exceeds_max_owners_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let caller = Address::generate(&env);
+    let issuer = caller.clone();
+
+    // Create 21 owners (exceeds MAX_MULTISIG_OWNERS=20)
+    let mut owners = Vec::new(&env);
+    for _ in 0..21 {
+        owners.push_back(Address::generate(&env));
+    }
+
+    let r = client.try_init_multisig(&caller, &owners, &11, &86400);
+    assert!(r.is_err());
+}
+
+#[test]
+fn multisig_init_threshold_equals_owners_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let caller = Address::generate(&env);
+    let issuer = caller.clone();
+
+    // 3 owners, threshold=3 (unanimous)
+    let mut owners = Vec::new(&env);
+    let owner1 = Address::generate(&env);
+    let owner2 = Address::generate(&env);
+    let owner3 = Address::generate(&env);
+    owners.push_back(owner1.clone());
+    owners.push_back(owner2.clone());
+    owners.push_back(owner3.clone());
+
+    client.init_multisig(&caller, &owners, &3, &86400);
+    assert_eq!(client.get_multisig_threshold(), Some(3));
+    assert_eq!(client.get_multisig_owners().len(), 3);
+}
+
+#[test]
+fn multisig_init_threshold_one_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let caller = Address::generate(&env);
+    let issuer = caller.clone();
+
+    // 5 owners, threshold=1 (any single owner can execute)
+    let mut owners = Vec::new(&env);
+    for _ in 0..5 {
+        owners.push_back(Address::generate(&env));
+    }
+
+    client.init_multisig(&caller, &owners, &1, &86400);
+    assert_eq!(client.get_multisig_threshold(), Some(1));
+    assert_eq!(client.get_multisig_owners().len(), 5);
+}
+
+#[test]
+fn multisig_init_duplicate_owners_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let caller = Address::generate(&env);
+    let issuer = caller.clone();
+
+    let owner1 = Address::generate(&env);
+    let owner2 = Address::generate(&env);
+
+    let mut owners = Vec::new(&env);
+    owners.push_back(owner1.clone());
+    owners.push_back(owner2.clone());
+    owners.push_back(owner1.clone()); // duplicate
+
+    let r = client.try_init_multisig(&caller, &owners, &2, &86400);
+    assert!(r.is_err());
+}
+
+#[test]
+fn multisig_init_then_propose_works() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let caller = Address::generate(&env);
+    let issuer = caller.clone();
+
+    let owner1 = Address::generate(&env);
+    let owner2 = Address::generate(&env);
+
+    let mut owners = Vec::new(&env);
+    owners.push_back(owner1.clone());
+    owners.push_back(owner2.clone());
+
+    // Initialize with 7-day duration
+    let duration = 7 * 24 * 60 * 60; // 7 days
+    client.init_multisig(&caller, &owners, &2, &duration);
+
+    // Verify initialization
+    assert_eq!(client.get_multisig_threshold(), Some(2));
+    assert_eq!(client.get_multisig_owners().len(), 2);
+
+    // Propose an action - this should work because duration is now persisted
+    let proposal_id = client.propose_action(&owner1, &ProposalAction::Freeze);
+    assert!(proposal_id == 0);
+
+    // Verify proposal was created
+    let proposal = client.get_proposal(&proposal_id).unwrap();
+    assert_eq!(proposal.id, 0);
+    assert_eq!(proposal.approvals.len(), 1); // proposer auto-approved
+    assert!(!proposal.executed);
+}
+
+#[test]
 fn multisig_propose_action_emits_events_and_auto_approves_proposer() {
     let (env, client, owner1, _owner2, _owner3, _caller) = multisig_setup();
 

@@ -4315,6 +4315,8 @@ impl RevoraRevenueShare {
     // ── Multisig admin logic ───────────────────────────────────
 
     pub const MAX_MULTISIG_OWNERS: u32 = 20;
+    /// Maximum proposal duration: 365 days in seconds.
+    pub const MAX_PROPOSAL_DURATION: u64 = 365 * 24 * 60 * 60;
 
     /// Initialize the multisig admin system. May only be called once.
     /// Only the caller (deployer/admin) needs to authorize; owners are registered
@@ -4323,6 +4325,20 @@ impl RevoraRevenueShare {
     /// # Soroban Limitation Note
     /// Soroban does not support requiring multiple signers in a single transaction
     /// invocation. Each owner must separately call `approve_action` to sign proposals.
+    ///
+    /// # Validation Rules
+    /// - `owners` must not be empty and must contain ≤ 20 unique addresses
+    /// - `threshold` must be in range [1, owners.len()]
+    /// - `proposal_duration` must be in range [1, 31,536,000] seconds (365 days)
+    ///
+    /// # Errors
+    /// - `NotAuthorized`: Caller is not the admin
+    /// - `NotInitialized`: Admin not set (contract not initialized)
+    /// - `LimitReached`: Already initialized, empty owners, too many owners, invalid threshold, or duplicate owners
+    /// - `InvalidAmount`: Duration is zero or exceeds maximum
+    ///
+    /// # Events
+    /// Emits `ms_init` with `(caller, (owners_count, threshold))` on success.
     pub fn init_multisig(
         env: Env,
         caller: Address,
@@ -4362,9 +4378,15 @@ impl RevoraRevenueShare {
             }
         }
 
+        // Validate proposal duration
+        if proposal_duration == 0 || proposal_duration > Self::MAX_PROPOSAL_DURATION {
+            return Err(RevoraError::InvalidAmount);
+        }
+
         env.storage().persistent().set(&DataKey::MultisigThreshold, &threshold);
         env.storage().persistent().set(&DataKey::MultisigOwners, &owners.clone());
         env.storage().persistent().set(&DataKey::MultisigProposalCount, &0_u32);
+        env.storage().persistent().set(&DataKey::MultisigProposalDuration, &proposal_duration);
         env.events().publish((EVENT_MULTISIG_INIT, caller.clone()), (owners.len(), threshold));
         Ok(())
     }
