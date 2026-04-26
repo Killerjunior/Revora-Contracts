@@ -100,12 +100,17 @@ Auth failures (e.g. wrong signer) are signaled by host/panic, not `RevoraError`.
 
 ### Contract version and migration (#23)
 
-- **Version:** Call `get_version()` to read the current contract version (a constant, e.g. `1`). This value is bumped when storage layout or semantics change in a way that affects compatibility.
-- **Upgrade strategy:** This codebase deploys a single WASM contract; there is no in-place upgrade. Future upgrades are expected to:
+- **Version:** Call `get_version()` to read the current contract version (a constant, e.g., `4`). This value is bumped when storage layout or semantics change in a way that affects compatibility.
+- **Upgrade strategy:** This codebase deploys a single WASM contract; Soroban has no EVM-style proxy upgrade, so upgrades require deploying a new contract instance. Future upgrades follow this process:
   1. Deploy a new contract (new WASM) with a higher `CONTRACT_VERSION`.
-  2. Optionally run a one-time migration (e.g. admin or migration script) that reads state from the old contract and writes into the new one, or that emits migration-milestone events for indexers.
-  3. Indexers and frontends should use `get_version()` to detect the deployed version and handle schema/API differences.
-- **Migration milestones:** When a new version is deployed, integrators can treat the first transaction that succeeds on the new contract as a migration milestone; the contract does not currently emit a dedicated "migration" event, but event schemas may include a version field (e.g. v1 events) for consumers.
+  2. Optionally run a one-time migration (e.g., admin or migration script) that reads state from the old contract and writes into the new one, or that emits migration-milestone events for indexers.
+  3. **Re-point consumers:** Update all frontend, backend, and indexer configurations to use the new contract address. Indexers and custodial backends must:
+     - Update their contract address references.
+     - Check `get_version()` on the new contract to confirm the upgrade.
+     - Update event parsing and API handling logic if the new version introduces changes to event schemas or method signatures.
+     - Treat the first successful transaction on the new contract as the migration cutover point.
+  4. The old contract remains deployed but should be considered inactive; consumers should not interact with it post-migration.
+- **Migration milestones:** When a new version is deployed, integrators can treat the first transaction that succeeds on the new contract as a migration milestone; the contract does not currently emit a dedicated "migration" event, but event schemas may include a version field (e.g., v1 events) for consumers.
 
 ### Input parameter validation (#35)
 
