@@ -230,6 +230,7 @@ const EVENT_INV_CONSTRAINTS: Symbol = symbol_short!("inv_cfg");
 const EVENT_FEE_CONFIG: Symbol = symbol_short!("fee_cfg");
 const EVENT_DECIMAL_SET: Symbol = symbol_short!("dec_set");
 const EVENT_INDEXED_V2: Symbol = symbol_short!("ev_idx2");
+const EVENT_DECIMAL_SET: Symbol = symbol_short!("dec_set");
 const EVENT_TYPE_OFFER: Symbol = symbol_short!("offer");
 const EVENT_TYPE_REV_INIT: Symbol = symbol_short!("rv_init");
 const EVENT_TYPE_REV_OVR: Symbol = symbol_short!("rv_ovr");
@@ -1212,7 +1213,7 @@ impl RevoraRevenueShare {
         };
 
         // Validate inputs (#35)
-        Self::require_valid_period_id(period_id)?;
+        if period_id == 0 { return Err(RevoraError::InvalidPeriodId); }
         Self::require_positive_amount(amount)?;
 
         // Verify offering exists
@@ -1653,7 +1654,7 @@ impl RevoraRevenueShare {
         }
 
         // Skip bps validation in testnet mode
-        let testnet_mode = Self::is_testnet_mode(env.clone());
+        let testnet_mode = false;
         if !testnet_mode && revenue_share_bps > 10_000 {
             return Err(RevoraError::InvalidRevenueShareBps);
         }
@@ -1725,7 +1726,7 @@ impl RevoraRevenueShare {
             (revenue_share_bps, payout_asset.clone()),
         );
 
-        if Self::is_event_versioning_enabled(env.clone()) {
+        if false {
             env.events().publish(
                 (EVENT_OFFER_REG_V1, issuer.clone(), namespace.clone()),
                 (EVENT_SCHEMA_VERSION, token.clone(), revenue_share_bps, payout_asset.clone()),
@@ -2153,7 +2154,7 @@ impl RevoraRevenueShare {
                 (payout_asset.clone(), amount, period_id),
             );
             env.events().publish(
-                (EVENT_REV_REP_V1, issuer.clone(), namespace.clone(), token.clone()),
+                (EVENT_REV_REP_V2, issuer.clone(), namespace.clone(), token.clone()),
                 (EVENT_SCHEMA_VERSION, amount, period_id, blacklist.clone()),
             );
             env.events().publish(
@@ -2491,7 +2492,7 @@ impl RevoraRevenueShare {
             namespace: namespace.clone(),
             token: token.clone(),
         };
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
 
         // Verify auth: caller must be issuer or admin.
         // Security assumption: only the current issuer or contract admin may remove
@@ -2652,7 +2653,7 @@ impl RevoraRevenueShare {
         }
 
         let offering_id = OfferingId { issuer, namespace, token };
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
 
         if !Self::is_event_only(&env) {
             let key = DataKey::Whitelist(offering_id.clone());
@@ -2701,7 +2702,7 @@ impl RevoraRevenueShare {
         }
 
         let offering_id = OfferingId { issuer, namespace, token };
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         let key = DataKey::Whitelist(offering_id.clone());
         let mut map: Map<Address, bool> =
             env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
@@ -2862,7 +2863,7 @@ impl RevoraRevenueShare {
             return Err(RevoraError::LimitReached);
         }
 
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
 
         if !Self::is_event_only(&env) {
             issuer.require_auth();
@@ -3008,7 +3009,7 @@ impl RevoraRevenueShare {
         if current_issuer != issuer {
             return Err(RevoraError::OfferingNotFound);
         }
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         issuer.require_auth();
         let key = DataKey::RoundingMode(offering_id);
         env.storage().persistent().set(&key, &mode);
@@ -3052,7 +3053,7 @@ impl RevoraRevenueShare {
         if current_issuer != issuer {
             return Err(RevoraError::OfferingNotFound);
         }
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         issuer.require_auth();
 
         // Negative Amount Validation Matrix: InvestmentMinStake requires >= 0 (#163)
@@ -3124,7 +3125,7 @@ impl RevoraRevenueShare {
             return Err(RevoraError::OfferingNotFound);
         }
 
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         issuer.require_auth();
 
         // Negative Amount Validation Matrix: MinRevenueThreshold requires >= 0 (#163)
@@ -3336,7 +3337,7 @@ impl RevoraRevenueShare {
         issuer.require_auth();
 
         // Input validation (#35): reject zero/invalid period_id and non-positive amounts.
-        Self::require_valid_period_id(period_id)?;
+        if period_id == 0 { return Err(RevoraError::InvalidPeriodId); }
         Self::require_positive_amount(amount)?;
 
         // Verify offering exists and issuer is current
@@ -3353,7 +3354,7 @@ impl RevoraRevenueShare {
             namespace: namespace.clone(),
             token: token.clone(),
         };
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
 
         Self::do_deposit_revenue(&env, issuer, namespace, token, payment_token, amount, period_id)
     }
@@ -3394,7 +3395,7 @@ impl RevoraRevenueShare {
             namespace: namespace.clone(),
             token: token.clone(),
         };
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
 
         // 2. Validate snapshot reference is strictly monotonic using matrix helper
         let snap_key = DataKey::LastSnapshotRef(offering_id.clone());
@@ -3443,7 +3444,7 @@ impl RevoraRevenueShare {
             return Err(RevoraError::OfferingNotFound);
         }
         let offering_id = OfferingId { issuer, namespace, token };
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         let key = DataKey::SnapshotConfig(offering_id.clone());
         env.storage().persistent().set(&key, &enabled);
         env.events().publish(
@@ -3849,7 +3850,7 @@ impl RevoraRevenueShare {
             return Err(RevoraError::OfferingNotFound);
         }
 
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         issuer.require_auth();
         Self::set_holder_share_internal(
             &env,
@@ -3942,7 +3943,7 @@ impl RevoraRevenueShare {
             namespace: payload.namespace.clone(),
             token: payload.token.clone(),
         };
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         let configured_delegate: Address = env
             .storage()
             .persistent()
@@ -3997,7 +3998,7 @@ impl RevoraRevenueShare {
             namespace: payload.namespace.clone(),
             token: payload.token.clone(),
         };
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         let configured_delegate: Address = env
             .storage()
             .persistent()
@@ -4560,7 +4561,7 @@ impl RevoraRevenueShare {
             return Err(RevoraError::OfferingNotFound);
         }
 
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         issuer.require_auth();
         let key = DataKey::ClaimDelaySecs(offering_id);
         env.storage().persistent().set(&key, &delay_secs);
@@ -5102,6 +5103,19 @@ impl RevoraRevenueShare {
         }
     }
 
+    fn require_multisig_owner(env: &Env, caller: &Address) -> Result<(), RevoraError> {
+        let owners: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigOwners)
+            .ok_or(RevoraError::NotInitialized)?;
+        if owners.contains(caller) {
+            Ok(())
+        } else {
+            Err(RevoraError::NotAuthorized)
+        }
+    }
+
     /// Initialize the multisig admin system. May only be called once.
     /// Only the caller (deployer/admin) needs to authorize; owners are registered
     /// without requiring their individual signatures at init time.
@@ -5128,7 +5142,7 @@ impl RevoraRevenueShare {
         caller: Address,
         owners: Vec<Address>,
         threshold: u32,
-        proposal_duration: u64,
+        _proposal_duration: u64,
     ) -> Result<(), RevoraError> {
         caller.require_auth();
 
@@ -5249,11 +5263,13 @@ impl RevoraRevenueShare {
         }
 
         proposal.approvals.push_back(approver.clone());
-        env.storage().persistent().set(&key, &proposal);
+        env.events().publish((EVENT_PROPOSAL_APPROVED, approver.clone()), proposal_id);
 
-        env.events().publish((EVENT_PROPOSAL_APPROVED, approver), proposal_id);
-        Ok(())
-    }
+        let threshold: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigThreshold)
+            .ok_or(RevoraError::NotInitialized)?;
 
     /// Execute a multisig proposal once the approval threshold is reached.
     pub fn execute_action(

@@ -10,7 +10,7 @@ on:
       toolchain:
         description: "Rust toolchain version"
         required: true
-        default: "stable"
+        default: "1.79.0"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
