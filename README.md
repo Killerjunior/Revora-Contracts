@@ -290,7 +290,7 @@ Offering Token (Address)
 
 **Integration notes:**
 - Offerings are **immutable** after registration
-- No duplicate prevention; same (issuer, token) can be registered multiple times with different indices
+- **Duplicate prevention:** Registration is idempotent; re-registering the same `(issuer, namespace, token)` is a no-op that returns `Ok(())`, preserving the original registration's parameters.
 - Off-chain systems should track registration events to build offering directories
 
 ---
