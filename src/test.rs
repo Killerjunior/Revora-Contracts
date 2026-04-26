@@ -2677,6 +2677,161 @@ fn multiple_holders_independent_claim_indices() {
     assert_eq!(balance(&env, &payment_token, &holder_b), 90_000);
 }
 
+// ── claim idempotency tests (#290) ──────────────────────────────────────────
+
+/// Retry after a successful claim must not re-pay the same periods.
+/// Verifies: cursor is stable, second call returns NoPendingClaims.
+#[test]
+fn claim_idempotency_retry_after_full_claim_returns_no_pending() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let holder = Address::generate(&env);
+
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &5_000); // 50%
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &100_000, &1);
+
+    let payout = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+    assert_eq!(payout, 50_000);
+
+    // Retry: no new periods deposited — must not double-pay
+    let result = client.try_claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+    assert_eq!(result, Err(Ok(RevoraError::NoPendingClaims)));
+    // Balance unchanged after retry
+    assert_eq!(balance(&env, &payment_token, &holder), 50_000);
+}
+
+/// Cursor must not regress: after a partial claim the next call starts from
+/// where the previous one left off, never re-processing already-claimed periods.
+#[test]
+fn claim_idempotency_cursor_does_not_regress_after_partial_claim() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let holder = Address::generate(&env);
+
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &10_000); // 100%
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &100_000, &1);
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &200_000, &2);
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &300_000, &3);
+
+    // Claim only the first period
+    let p1 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &1);
+    assert_eq!(p1, 100_000);
+
+    // Claim the remaining two — must not include period 1 again
+    let p2 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+    assert_eq!(p2, 500_000); // 200k + 300k
+
+    // Total must equal sum of all periods, not more
+    assert_eq!(balance(&env, &payment_token, &holder), 600_000);
+}
+
+/// Calling claim when no new periods have been deposited since the last
+/// successful claim must return NoPendingClaims without touching storage.
+#[test]
+fn claim_idempotency_no_new_periods_returns_no_pending() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let holder = Address::generate(&env);
+
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &5_000);
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &100_000, &1);
+
+    client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+
+    // No new deposit — repeated calls must all fail with NoPendingClaims
+    for _ in 0..3 {
+        let r = client.try_claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+        assert_eq!(r, Err(Ok(RevoraError::NoPendingClaims)));
+    }
+    assert_eq!(balance(&env, &payment_token, &holder), 50_000);
+}
+
+/// Backfill ordering: periods deposited out of chronological order are still
+/// claimed in deposit-index order; cursor advances monotonically.
+#[test]
+fn claim_idempotency_backfill_deposit_order_cursor_monotonic() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let holder = Address::generate(&env);
+
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &10_000); // 100%
+
+    // Deposit with non-sequential period IDs (simulating backfill)
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &300_000, &30);
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &100_000, &10);
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &200_000, &20);
+
+    // Claim first two by deposit index (period_ids 30, 10)
+    let p1 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &2);
+    assert_eq!(p1, 400_000); // 300k + 100k
+
+    // Cursor is now at index 2; only period_id 20 remains
+    let p2 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+    assert_eq!(p2, 200_000);
+
+    // No more periods
+    let r = client.try_claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+    assert_eq!(r, Err(Ok(RevoraError::NoPendingClaims)));
+
+    assert_eq!(balance(&env, &payment_token, &holder), 600_000);
+}
+
+/// Two holders claiming the same periods independently must each receive
+/// exactly their share — no cross-contamination of cursors.
+#[test]
+fn claim_idempotency_per_holder_cursor_isolation() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let holder_a = Address::generate(&env);
+    let holder_b = Address::generate(&env);
+
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder_a, &5_000); // 50%
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder_b, &5_000); // 50%
+
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &100_000, &1);
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &200_000, &2);
+
+    // A claims all; B has not claimed yet
+    let pa = client.claim(&holder_a, &issuer, &symbol_short!("def"), &token, &0);
+    assert_eq!(pa, 150_000); // 50% of 300k
+
+    // A retrying must fail
+    assert_eq!(
+        client.try_claim(&holder_a, &issuer, &symbol_short!("def"), &token, &0),
+        Err(Ok(RevoraError::NoPendingClaims))
+    );
+
+    // B's cursor is unaffected — still claims both periods
+    let pb = client.claim(&holder_b, &issuer, &symbol_short!("def"), &token, &0);
+    assert_eq!(pb, 150_000);
+
+    assert_eq!(balance(&env, &payment_token, &holder_a), 150_000);
+    assert_eq!(balance(&env, &payment_token, &holder_b), 150_000);
+}
+
+/// After a new deposit, a holder who already claimed all prior periods can
+/// claim the new period exactly once.
+#[test]
+fn claim_idempotency_new_deposit_after_exhaustion_claimable_once() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let holder = Address::generate(&env);
+
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &10_000); // 100%
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &100_000, &1);
+
+    // Exhaust all periods
+    client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+
+    // New deposit arrives
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &50_000, &2);
+
+    // Exactly one successful claim for the new period
+    let p = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+    assert_eq!(p, 50_000);
+
+    // Retry must fail
+    assert_eq!(
+        client.try_claim(&holder, &issuer, &symbol_short!("def"), &token, &0),
+        Err(Ok(RevoraError::NoPendingClaims))
+    );
+    assert_eq!(balance(&env, &payment_token, &holder), 150_000);
+}
+
 #[test]
 fn claim_after_holder_share_change() {
     let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
