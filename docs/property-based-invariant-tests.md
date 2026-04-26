@@ -7,7 +7,7 @@ Production-grade property-based testing using `proptest` to validate core invari
 
 | Invariant | Description | Property Test |
 |-----------|-------------|---------------|
-| **Period Ordering** | `period_id` strictly increasing per offering (`LastPeriodId`) | `proptest_period_ordering`: Reject non-increasing sequences |
+| **Period Ordering** | New deposit and report periods are strictly increasing on their own independent cursors (`LastDepositedPeriodId`, `LastReportedPeriodId`) | `proptest_period_ordering`: Reject non-increasing sequences |
 | **Payout Conservation** | Σ(claims) ≤ Σ(deposits) per offering/holder | `check_invariants`: Total claimed ≤ deposited |
 | **No Double-Claims** | `LastClaimedIdx` prevents re-claiming | `proptest_random_operations`: Claims advance index |
 | **Blacklist Enforcement** | Blacklisted holder payout = 0 | `proptest_blacklist_enforcement`: 100% test coverage |
@@ -86,4 +86,3 @@ FAILED prop_random_operations:
 ```
 
 **Status**: Implemented & passing. PR-ready.**
-

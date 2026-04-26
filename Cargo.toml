@@ -16,4 +16,3 @@ soroban-sdk = { version = "20.5.0", features = ["testutils", "alloc"] }
 opt-level = "z"
 overflow-checks = true
 
-
