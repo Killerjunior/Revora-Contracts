@@ -92,6 +92,66 @@ fn report_revenue_zero_period_id_rejected() {
     assert!(client.get_audit_summary(&issuer, &symbol_short!("def"), &token).is_none());
 }
 
+/// `deposit_revenue` with non-sequential period (gap) must return `InvalidPeriodId`.
+#[test]
+fn deposit_revenue_gap_period_rejected() {
+    let (_env, client, issuer, offering_token, payment_token) = setup_funded();
+
+    // Deposit period 1
+    client
+        .deposit_revenue(
+            &issuer,
+            &symbol_short!("def"),
+            &offering_token,
+            &payment_token,
+            &1_000,
+            &1,
+        )
+        .unwrap();
+
+    // Try to deposit period 3 (gap)
+    let result = client.try_deposit_revenue(
+        &issuer,
+        &symbol_short!("def"),
+        &offering_token,
+        &payment_token,
+        &1_000,
+        &3,
+    );
+    assert_eq!(result, Err(Ok(RevoraError::InvalidPeriodId)));
+}
+
+/// `report_revenue` with non-sequential period (gap) must return `InvalidPeriodId`.
+#[test]
+fn report_revenue_gap_period_rejected() {
+    let (_env, client, issuer, offering_token, _payment_token) = setup_funded();
+
+    // Report period 1
+    client
+        .report_revenue(
+            &issuer,
+            &symbol_short!("def"),
+            &offering_token,
+            &offering_token,
+            &1_000,
+            &1,
+            &false,
+        )
+        .unwrap();
+
+    // Try to report period 3 (gap)
+    let result = client.try_report_revenue(
+        &issuer,
+        &symbol_short!("def"),
+        &offering_token,
+        &offering_token,
+        &1_000,
+        &3,
+        &false,
+    );
+    assert_eq!(result, Err(Ok(RevoraError::InvalidPeriodId)));
+}
+
 /// `deposit_revenue` with period_id=0 must return `InvalidPeriodId`.
 #[test]
 fn deposit_revenue_zero_period_id_rejected() {
@@ -236,6 +296,36 @@ fn deposit_revenue_duplicate_period_rejected() {
 
     // Period count must remain 1
     assert_eq!(client.get_period_count(&issuer, &symbol_short!("def"), &offering_token), 1);
+}
+
+/// `deposit_revenue` with duplicate period must return `PeriodAlreadyDeposited`
+/// even if it's technically also a non-sequential period (e.g. depositing 1 again when last is 1).
+#[test]
+fn deposit_revenue_duplicate_next_period_rejected() {
+    let (_env, client, issuer, offering_token, payment_token) = setup_funded();
+
+    // Deposit period 1
+    client
+        .deposit_revenue(
+            &issuer,
+            &symbol_short!("def"),
+            &offering_token,
+            &payment_token,
+            &1_000,
+            &1,
+        )
+        .unwrap();
+
+    // Try to deposit period 1 again
+    let result = client.try_deposit_revenue(
+        &issuer,
+        &symbol_short!("def"),
+        &offering_token,
+        &payment_token,
+        &1_000,
+        &1,
+    );
+    assert_eq!(result, Err(Ok(RevoraError::PeriodAlreadyDeposited)));
 }
 
 /// Reporting the same period_id twice without override flag emits a rejected event but does not
