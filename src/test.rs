@@ -2022,15 +2022,19 @@ fn deposit_revenue_transfers_tokens() {
 }
 
 #[test]
-fn deposit_revenue_sparse_period_ids() {
+fn deposit_revenue_sparse_period_ids_rejected() {
     let (_env, client, issuer, token, payment_token, _contract_id) = claim_setup();
 
-    // Deposit with non-sequential period IDs
-    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &100_000, &10);
-    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &200_000, &50);
-    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &300_000, &100);
+    // Deposit with non-sequential period IDs (first period must be 1)
+    let res1 = client.try_deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &100_000, &10);
+    assert_eq!(res1, Err(Ok(RevoraError::InvalidPeriodId)));
 
-    assert_eq!(client.get_period_count(&issuer, &symbol_short!("def"), &token), 3);
+    // Deposit valid period 1
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &100_000, &1);
+
+    // Period 50 fails (gap from 1)
+    let res2 = client.try_deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &200_000, &50);
+    assert_eq!(res2, Err(Ok(RevoraError::InvalidPeriodId)));
 }
 
 #[test]
@@ -2284,16 +2288,16 @@ fn claim_fails_for_zero_share_holder() {
 }
 
 #[test]
-fn claim_sparse_period_ids() {
+fn claim_sequential_period_ids() {
     let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
     let holder = Address::generate(&env);
 
     client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &10_000); // 100%
 
-    // Non-sequential period IDs
-    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &50_000, &10);
-    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &75_000, &50);
-    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &125_000, &100);
+    // Sequential period IDs
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &50_000, &1);
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &75_000, &2);
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &125_000, &3);
 
     let payout = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
     assert_eq!(payout, 250_000); // 50k + 75k + 125k

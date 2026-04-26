@@ -1126,7 +1126,7 @@ impl RevoraRevenueShare {
         }
         let key = DataKey::LastPeriodId(offering_id.clone());
         let last: u64 = env.storage().persistent().get(&key).unwrap_or(0);
-        if period_id <= last {
+        if period_id != last + 1 {
             return Err(RevoraError::InvalidPeriodId);
         }
         env.storage().persistent().set(&key, &period_id);
