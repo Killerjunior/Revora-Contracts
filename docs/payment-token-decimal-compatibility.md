@@ -43,6 +43,7 @@ Returns the configured decimal precision or `7` if not set.
 2. **Immutable after set**: There is no restriction on updating decimals after the fact, but changing decimals mid-offering will affect future claims inconsistently with past revenue reports. Issuers should set decimals before the first revenue report.
 3. **Overflow is safe**: All multiplications are guarded with `checked_mul`. Overflow returns `0`, preventing fund inflation but potentially causing zero payouts for extremely large amounts with low-decimal tokens.
 4. **Scope**: Decimals are per-offering, not per-asset globally. Two offerings with the same payout asset may have different decimal configurations.
+5. **Read-Side Pagination**: When computing holder shares iteratively off-chain, be aware that paginated endpoints (e.g., `get_offerings_page`, `get_blacklist_page`) are capped at a `MAX_PAGE_LIMIT` of 20 to prevent unbounded execution. Indexers fetching multiple properties must handle this cursor-based traversal safely.
 
 ## Example
 
