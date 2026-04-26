@@ -40,11 +40,11 @@ Each path below is explicitly tested:
 - `i128::MIN` and `i128::MIN + 1` as deposit/report amounts → `InvalidAmount`
 - `-1` as deposit/report amount → `InvalidAmount`
 - `0` as deposit amount → `InvalidAmount`
-- `0` as report amount → `InvalidAmount`
+- `0` as report amount → accepted audit entry (no transfer), still subject to threshold/override rules
 - `period_id == 0` → `InvalidPeriodId`
 - `bps = 10_001`, `bps = u32::MAX` → `InvalidRevenueShareBps`
 - `share_bps = 10_001` → `InvalidShareBps`
-- Duplicate period without `override_existing=true` → `PeriodAlreadyDeposited`
+- Duplicate report period without `override_existing=true` → `rev_rej` event, no state change
 - `report_revenue` on non-existent offering → `OfferingNotFound`
 - Claim by blacklisted holder → `HolderBlacklisted`
 - Any mutation while frozen → `ContractFrozen`
