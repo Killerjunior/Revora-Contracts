@@ -3186,6 +3186,42 @@ fn freeze_offering_unfreeze_by_admin_restores_mutation_path() {
 }
 
 #[test]
+fn freeze_offering_blocks_mutable_operations_except_claim() {
+    let (env, client, issuer, token_a, payment_token, _contract_id) = claim_setup();
+    let admin = Address::generate(&env);
+    client.set_admin(&admin);
+
+    client.freeze_offering(&issuer, &issuer, &symbol_short!("def"), &token_a);
+
+    assert_eq!(
+        client.try_report_revenue(&issuer, &symbol_short!("def"), &token_a, &100).unwrap_err().unwrap(),
+        RevoraError::OfferingFrozen
+    );
+
+    assert_eq!(
+        client.try_deposit_revenue(&issuer, &symbol_short!("def"), &token_a, &payment_token, &100, &1).unwrap_err().unwrap(),
+        RevoraError::OfferingFrozen
+    );
+
+    assert_eq!(
+        client.try_set_snapshot_config(&issuer, &symbol_short!("def"), &token_a, &true).unwrap_err().unwrap(),
+        RevoraError::OfferingFrozen
+    );
+
+    let holder = Address::generate(&env);
+    assert_eq!(
+        client.try_set_holder_share(&issuer, &symbol_short!("def"), &token_a, &holder, &100).unwrap_err().unwrap(),
+        RevoraError::OfferingFrozen
+    );
+
+    // Test claim is allowed
+    // Although there's no revenue deposited, the call goes through until it hits internal logic
+    // not related to freeze. In this case, `get_pending_periods` might be empty so claim returns 0.
+    let r = client.try_claim(&holder, &issuer, &symbol_short!("def"), &token_a, &0);
+    assert!(r.is_ok());
+}
+
+#[test]
 fn global_freeze_blocks_offering_freeze_endpoints() {
     let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
     let admin = Address::generate(&env);
