@@ -119,7 +119,9 @@ pub enum TestOperation {
     /// `blacklist_remove(caller, issuer, namespace, token, investor)`
     BlacklistRemove { caller: Address, issuer: Address, namespace: Symbol, token: Address, investor: Address },
     /// `set_concentration_limit(issuer, namespace, token, max_bps, enforce)`
-    SetConcentrationLimit { issuer: Address, namespace: Symbol, token: Address, max_bps: u32, enforce: bool },
+    SetConcentrationLimit { max_bps: u32, enforce: bool },
+    /// `report_concentration(issuer, namespace, token, concentration_bps)`
+    ReportConcentration { concentration_bps: u32 },
     /// `freeze()` — admin-only global freeze
     Freeze,
     /// `pause_admin(caller)` — admin-only pause
@@ -175,19 +177,9 @@ pub fn arb_set_concentration_limit() -> impl Strategy<Value = TestOperation> {
         .prop_map(|(max_bps, enforce)| TestOperation::SetConcentrationLimit { max_bps, enforce })
 }
 
-/// Strategy for `Freeze` operation.
-pub fn arb_freeze() -> impl Strategy<Value = TestOperation> {
-    Just(TestOperation::Freeze)
-}
-
-/// Strategy for `Pause` operation.
-pub fn arb_pause() -> impl Strategy<Value = TestOperation> {
-    any::<Address>().prop_map(|caller| TestOperation::Pause { caller })
-}
-
-/// Strategy for a single `SetClaimDelay` operation.
-pub fn arb_set_claim_delay() -> impl Strategy<Value = TestOperation> {
-    (0u64..=3600u64).prop_map(|delay_secs| TestOperation::SetClaimDelay { delay_secs })
+/// Strategy for a single `ReportConcentration` operation.
+pub fn arb_report_concentration() -> impl Strategy<Value = TestOperation> {
+    arb_valid_bps().prop_map(|concentration_bps| TestOperation::ReportConcentration { concentration_bps })
 }
 
 /// Strategy for any single valid operation (uniform distribution).
@@ -200,9 +192,9 @@ pub fn arb_any_operation() -> impl Strategy<Value = TestOperation> {
         arb_blacklist_add(),
         arb_blacklist_remove(),
         arb_set_concentration_limit(),
-        arb_freeze(),
-        arb_pause(),
-        arb_set_claim_delay(),
+        arb_report_concentration(),
+        Just(TestOperation::Freeze),
+        (0u64..=3600u64).prop_map(|d| TestOperation::SetClaimDelay { delay_secs: d }),
     ]
 }
 

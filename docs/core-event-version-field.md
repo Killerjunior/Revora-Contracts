@@ -87,3 +87,13 @@ match event.topic {
 
 **Upgrade Path**: v3 will bump EVENT_SCHEMA_VERSION_V2 → 3 when storage schemas change.
 
+## Window Events
+
+`set_report_window` and `set_claim_window` emit legacy (non-v2) events with topics
+`rep_win` and `clm_win` respectively. These are configuration events, not revenue-flow
+events, and are not included in the v2 schema table above.
+
+For full semantics of reporting and claiming windows — including boundary inclusivity,
+zero-width windows, reconfiguration mid-flight, and the relationship to claim delay —
+see [time-window-boundary-matrix.md](./time-window-boundary-matrix.md).
+

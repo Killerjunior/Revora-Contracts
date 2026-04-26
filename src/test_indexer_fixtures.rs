@@ -15,7 +15,7 @@ fn fixture_topics_have_stable_order_and_shape() {
     let ns = symbol_short!("def");
 
     let fixtures = client.get_indexer_fixture_topics(&issuer, &ns, &token, &7u64);
-    assert_eq!(fixtures.len(), 6);
+    assert_eq!(fixtures.len(), 15);
 
     let f0 = fixtures.get(0).unwrap();
     assert_eq!(f0.version, 2);
@@ -41,6 +41,33 @@ fn fixture_topics_have_stable_order_and_shape() {
     let f5 = fixtures.get(5).unwrap();
     assert_eq!(f5.event_type, symbol_short!("claim"));
     assert_eq!(f5.period_id, 0);
+
+    let f6 = fixtures.get(6).unwrap();
+    assert_eq!(f6.event_type, symbol_short!("admin_set"));
+
+    let f7 = fixtures.get(7).unwrap();
+    assert_eq!(f7.event_type, symbol_short!("fee_set"));
+
+    let f8 = fixtures.get(8).unwrap();
+    assert_eq!(f8.event_type, symbol_short!("fee_ast"));
+
+    let f9 = fixtures.get(9).unwrap();
+    assert_eq!(f9.event_type, symbol_short!("fee_off"));
+
+    let f10 = fixtures.get(10).unwrap();
+    assert_eq!(f10.event_type, symbol_short!("conc_lim"));
+
+    let f11 = fixtures.get(11).unwrap();
+    assert_eq!(f11.event_type, symbol_short!("rnd_mode"));
+
+    let f12 = fixtures.get(12).unwrap();
+    assert_eq!(f12.event_type, symbol_short!("meta_key"));
+
+    let f13 = fixtures.get(13).unwrap();
+    assert_eq!(f13.event_type, symbol_short!("meta_del"));
+
+    let f14 = fixtures.get(14).unwrap();
+    assert_eq!(f14.event_type, symbol_short!("ms_init"));
 }
 
 #[test]
