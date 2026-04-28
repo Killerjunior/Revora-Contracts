@@ -11,9 +11,12 @@ soroban-sdk = { version = "20.5.0", features = ["alloc"] }
 
 [dev-dependencies]
 soroban-sdk = { version = "20.5.0", features = ["testutils", "alloc"] }
+proptest = "1.4.0"
 
 [profile.release]
 opt-level = "z"
 overflow-checks = true
 
-
+[features]
+default = []
+stress-tests = []
