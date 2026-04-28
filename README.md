@@ -2,6 +2,17 @@
 
 Soroban contract for revenue-share offerings and blacklist management.
 
+## 🚨 CRITICAL SECURITY WARNING
+
+**TESTNET MODE DANGER:** This contract includes a "testnet mode" that relaxes critical validations for development/testing. **NEVER enable testnet mode on production/mainnet deployments.** 
+
+- **Check before use:** Always call `is_testnet_mode()` and verify it returns `false` for production contracts.
+- **Admin responsibility:** Only enable testnet mode during development/testing phases.
+- **Relaxed validations:** When enabled, allows `revenue_share_bps > 10000` and bypasses concentration enforcement, potentially leading to fund loss.
+- **Audit requirement:** Production deployments must be verified to have testnet mode disabled.
+
+**If `is_testnet_mode()` returns `true` on a production contract, DO NOT USE IT - funds may be at risk.**
+
 ## Contract interface summary (for integrators)
 
 *- **Issuer authority:** Only the offering issuer can register offerings, report revenue, set concentration limits, set rounding mode, and report concentration for that offering. The contract does not implement a separate "platform admin" role; all offering-level actions are issuer-authorized.
@@ -14,8 +25,9 @@ Soroban contract for revenue-share offerings and blacklist management.
 |--------|------------|---------|------|-------------|
 | `register_offering` | `issuer: Address`, `token: Address`, `revenue_share_bps: u32` | `Result<(), RevoraError>` | issuer | Register a revenue-share offering. Fails with `InvalidRevenueShareBps` if `revenue_share_bps > 10000`. |
 | `get_offering` | `issuer: Address`, `token: Address` | `Option<Offering>` | — | Fetch one offering by issuer and token. |
+| `get_payment_token` | `issuer: Address`, `namespace: Symbol`, `token: Address` | `Option<Address>` | — | Return the payment token locked by the first successful deposit. Returns `None` before the first successful deposit or for an unknown offering. |
 | `list_offerings` | `issuer: Address` | `Vec<Address>` | — | List offering tokens for issuer (first page only, up to 20). |
-| `report_revenue` | `issuer: Address`, `token: Address`, `amount: i128`, `period_id: u64` | `Result<(), RevoraError>` | issuer | Emit a revenue report; event includes current blacklist. Updates audit summary. Fails with `ConcentrationLimitExceeded` if holder concentration enforcement is on and reported concentration exceeds limit. |
+| `report_revenue` | `issuer: Address`, `token: Address`, `amount: i128`, `period_id: u64` | `Result<(), RevoraError>` | issuer | Emit or correct a revenue report. New periods update `AuditSummary`; existing periods may be corrected with `override_existing=true`, which emits explicit override events and applies the net delta to `total_revenue` without incrementing `report_count`. |
 | `get_offering_count` | `issuer: Address` | `u32` | — | Total offerings registered by issuer. |
 | `get_offerings_page` | `issuer: Address`, `start: u32`, `limit: u32` | `(Vec<Offering>, Option<u32>)` | — | Paginated offerings. `limit` capped at 20. `next_cursor` is `Some(next_start)` or `None`. |
 | `blacklist_add` | `caller: Address`, `token: Address`, `investor: Address` | — | issuer | Add investor to blacklist for token. Only the current issuer can perform this action. Idempotent. |
@@ -26,10 +38,11 @@ Soroban contract for revenue-share offerings and blacklist management.
 | `report_concentration` | `issuer: Address`, `token: Address`, `concentration_bps: u32` | `Result<(), RevoraError>` | issuer | Report current top-holder concentration (bps). Emits `conc_warn` if over configured limit. |
 | `get_concentration_limit` | `issuer: Address`, `token: Address` | `Option<ConcentrationLimitConfig>` | — | Get concentration limit config for offering. |
 | `get_current_concentration` | `issuer: Address`, `token: Address` | `Option<u32>` | — | Last reported concentration (bps) for offering. |
-| `get_audit_summary` | `issuer: Address`, `token: Address` | `Option<AuditSummary>` | — | Per-offering audit summary (total_revenue, report_count). |
+| `get_audit_summary` | `issuer: Address`, `token: Address` | `Option<AuditSummary>` | — | Per-offering audit summary cache (`total_revenue`, `report_count`) derived from persisted revenue reports. |
+| `reconcile_audit_summary` | `issuer: Address`, `token: Address` | `AuditReconciliationResult` | — | Recompute the audit summary from persisted reports and compare it to the stored cache. Read-only. |
 | `set_rounding_mode` | `issuer: Address`, `token: Address`, `mode: RoundingMode` | `Result<(), RevoraError>` | issuer | Set rounding mode for share calculations. Offering must exist. |
 | `get_rounding_mode` | `issuer: Address`, `token: Address` | `RoundingMode` | — | Get rounding mode (default Truncation if not set). |
-| `set_min_revenue_threshold` | `issuer: Address`, `token: Address`, `min_amount: i128` | `Result<(), RevoraError>` | issuer | Per-offering minimum revenue per period; below this, `report_revenue` emits `rev_below` and skips updating reports/audit. 0 = disabled. Emits `min_rev` when set or changed. |
+| `set_min_revenue_threshold` | `issuer: Address`, `token: Address`, `min_amount: i128` | `Result<(), RevoraError>` | issuer | Per-offering minimum revenue for new periods. When a new `report_revenue` call is below the threshold, the contract emits `rev_below` and skips report/audit state updates. Stored periods can still be corrected explicitly with `override_existing=true`. |
 | `get_min_revenue_threshold` | `issuer: Address`, `token: Address` | `i128` | — | Minimum revenue threshold for offering (0 = none). |
 | `compute_share` | `amount: i128`, `revenue_share_bps: u32`, `mode: RoundingMode` | `i128` | — | Compute share of amount at given bps with given rounding. Bounds: 0 ≤ result ≤ amount. |
 | `propose_issuer_transfer` | `token: Address`, `new_issuer: Address` | `Result<(), RevoraError>` | current issuer | Propose transferring issuer control to a new address. First step of two-step transfer. |
@@ -52,13 +65,16 @@ Soroban contract for revenue-share offerings and blacklist management.
 | Code | Name | Meaning |
 |------|------|---------|
 | 1 | `InvalidRevenueShareBps` | `revenue_share_bps` > 10000. |
-| 2 | `LimitReached` | Reserved / offering not found (e.g. for set_concentration_limit, set_rounding_mode). |
+| 2 | `LimitReached` | Reserved / offering not found (e.g. for set_concentration_limit, set_rounding_mode). Also returned when `set_report_window` / `set_claim_window` is called with `start > end`. |
 | 3 | `ConcentrationLimitExceeded` | Holder concentration exceeds configured limit and enforcement is on; `report_revenue` rejected. |
+| 11 | `ClaimDelayNotElapsed` | Revenue for this period is not yet claimable; the per-offering delay has not elapsed since deposit. |
 | 12 | `IssuerTransferPending` | A transfer is already pending for this offering. |
 | 13 | `NoTransferPending` | No transfer is pending for this offering (accept/cancel failed). |
 | 14 | `UnauthorizedTransferAccept` | Caller is not authorized to accept this transfer. |
 | 17 | `InvalidAmount` | Amount is invalid (e.g. negative, or zero for deposit) (#35). |
 | 18 | `InvalidPeriodId` | period_id is 0 where a positive value is required (#35). |
+| 25 | `ReportingWindowClosed` | Current ledger timestamp is outside the configured reporting window; `report_revenue` rejected. |
+| 26 | `ClaimWindowClosed` | Current ledger timestamp is outside the configured claiming window; `claim` rejected. |
 
 Auth failures (e.g. wrong signer) are signaled by host/panic, not `RevoraError`. Use `try_register_offering`, `try_report_revenue`, and similar `try_*` client methods to receive contract errors as `Result`.
 
@@ -67,12 +83,17 @@ Auth failures (e.g. wrong signer) are signaled by host/panic, not `RevoraError`.
 | Topic / name | Payload | When |
 |--------------|---------|------|
 | `offer_reg` | `(issuer), (token, revenue_share_bps)` | After `register_offering`. |
-| `rev_rep` | `(issuer, token), (amount, period_id, blacklist_vec)` | After `report_revenue`. |
+| `rev_init` | `(issuer, token), (amount, period_id, blacklist_vec)` | First persisted report for a period. |
+| `rev_ovrd` | `(issuer, token), (new_amount, period_id, old_amount, blacklist_vec)` | Accepted correction of an existing persisted period (`override_existing=true`). |
+| `rev_rej` | `(issuer, token), (attempted_amount, period_id, existing_amount, blacklist_vec)` | Duplicate report attempt for an existing period when `override_existing=false`; no state change. |
+| `rev_rep` | `(issuer, token), (amount, period_id, blacklist_vec)` | Receipt for an accepted persisted report call (initial or override). Use `rev_init` plus `rev_ovrd` to reconstruct audit totals. |
 | `bl_add` | `(token, caller), investor` | After `blacklist_add`. |
 | `bl_rem` | `(token, caller), investor` | After `blacklist_remove`. |
 | `min_rev` | `(issuer, token), (previous_amount, new_amount)` | When `set_min_revenue_threshold` is set or changed. |
-| `rev_below` | `(issuer, token), (amount, period_id, threshold)` | When `report_revenue` is called with amount below the offering's minimum threshold; no report/audit update. |
+| `rev_below` | `(issuer, token), (amount, period_id, threshold)` | When a new `report_revenue` call is below the offering's minimum threshold; no report/audit update and the period remains available for a later accepted report. |
 | `conc_warn` | `(issuer, token), (concentration_bps, limit_bps)` | When `report_concentration` is called and reported concentration exceeds configured limit (warning only; enforce blocks at `report_revenue`). |
+| `rep_win` | `(issuer, namespace, token), (start_timestamp, end_timestamp)` | When `set_report_window` is called. |
+| `clm_win` | `(issuer, namespace, token), (start_timestamp, end_timestamp)` | When `set_claim_window` is called. |
 | `iss_prop` | `(token), (current_issuer, proposed_new_issuer)` | When `propose_issuer_transfer` is called. |
 | `iss_acc` | `(token), (old_issuer, new_issuer)` | When `accept_issuer_transfer` completes the transfer. |
 | `iss_canc` | `(token), (current_issuer, proposed_new_issuer)` | When `cancel_issuer_transfer` revokes a pending transfer. |
@@ -87,21 +108,98 @@ Auth failures (e.g. wrong signer) are signaled by host/panic, not `RevoraError`.
      - `get_claimable_chunk(env, issuer, namespace, token, holder, start_idx, count)` — computes claimable amount over a bounded index window and returns a `next_cursor` when further eligible periods exist.
      These helpers enforce reasonable caps (`MAX_PAGE_LIMIT`, `MAX_CHUNK_PERIODS`) so off-chain orchestrators should iterate using the returned cursors until exhaustion.
 - **Ordering:** `get_offerings_page` returns offerings by registration index. `get_blacklist` returns addresses in insertion order. `get_pending_periods` returns period IDs by deposit index. All query results are deterministic.
-- **Minimum revenue threshold:** Issuers can set `set_min_revenue_threshold(issuer, token, min_amount)`. When `report_revenue` is called with `amount < min_amount`, the contract emits `rev_below` and does not update revenue reports or audit summary (skipped distribution). Set to 0 to disable.
+- **Minimum revenue threshold:** Issuers can set `set_min_revenue_threshold(issuer, token, min_amount)`. When a new `report_revenue` call is made with `amount < min_amount`, the contract emits `rev_below` and does not update revenue reports, `AuditSummary`, or the report-period cursor. Set to 0 to disable. Thresholds do not block explicit corrections of already persisted periods.
 - **Off-chain:** Prefer small page sizes and bounded blacklist sizes for predictable gas. See storage/gas tests in `src/test.rs` for stress behavior.
 - **Holder concentration:** Concentration is not computed on-chain (no token balance reads). Issuer or indexer calls `report_concentration(issuer, token, bps)` with the current top-holder share in bps; the contract stores it and enforces or warns based on `set_concentration_limit`. Use `try_report_revenue` when enforcement may be enabled.
 - **Rounding:** Use `compute_share(amount, revenue_share_bps, mode)` for consistent distribution math. Per-offering default is `get_rounding_mode(issuer, token)` (Truncation if unset). Sum of shares must not exceed total; both modes keep result in [0, amount].
 - **Issuer Transfer:** See [ISSUER_TRANSFER.md](./ISSUER_TRANSFER.md) for comprehensive documentation on securely transferring issuer control via the two-step propose/accept flow.
+- **Payment token locking:** Once an offering's payout asset is set at registration, all deposits must use that same token. See [docs/payment-token-locking.md](./docs/payment-token-locking.md) for invariants and test coverage.
+- **Payment token decimals:** Different Stellar assets use different decimal precisions (e.g., USDC=6, XLM=7, WBTC=8). Use `set_payment_token_decimals` to configure the offering's asset precision; the contract normalizes raw amounts to 7-decimal canonical units before computing holder shares. See [docs/payment-token-decimal-compatibility.md](./docs/payment-token-decimal-compatibility.md) for details and examples.
 - **Testnet mode:** Admin can enable testnet mode via `set_testnet_mode(true)` to relax certain validations for non-production deployments. When enabled: (1) `register_offering` allows `revenue_share_bps > 10000`, (2) `report_revenue` skips concentration enforcement. Use only for testnet/development environments. Check mode with `is_testnet_mode()`.
+- **Reporting and claiming windows:** Issuers can optionally restrict when `report_revenue` and `claim` are permitted using time-based access windows. See [Time Windows](#time-based-access-windows-reporting--claiming) below.
 
-### Contract version and migration (#23)
+### Time-Based Access Windows (Reporting & Claiming)
 
-- **Version:** Call `get_version()` to read the current contract version (a constant, e.g. `1`). This value is bumped when storage layout or semantics change in a way that affects compatibility.
-- **Upgrade strategy:** This codebase deploys a single WASM contract; there is no in-place upgrade. Future upgrades are expected to:
+Issuers can configure per-offering time windows that gate `report_revenue` and `claim`.
+If no window is set, the operation is always permitted.
+
+#### Soroban Time Source
+
+All window checks use `env.ledger().timestamp()` — the Unix timestamp (seconds since
+epoch) of the current ledger's close time. This value is set by Stellar network
+consensus and is monotonically non-decreasing. It is **not** manipulable per-transaction.
+
+#### Window Methods
+
+| Method | Auth | Description |
+|--------|------|-------------|
+| `set_report_window(issuer, namespace, token, start_timestamp, end_timestamp)` | issuer | Configure when `report_revenue` is permitted. If unset, always open. |
+| `set_claim_window(issuer, namespace, token, start_timestamp, end_timestamp)` | issuer | Configure when `claim` is permitted. If unset, always open. |
+| `get_report_window(issuer, namespace, token)` | — | Read current report window (`None` if unset). |
+| `get_claim_window(issuer, namespace, token)` | — | Read current claim window (`None` if unset). |
+
+#### Boundary Semantics
+
+Windows are **inclusive on both ends**: a transaction whose ledger closes at exactly
+`start_timestamp` or `end_timestamp` is permitted.
+
+```
+is_open = now >= start_timestamp && now <= end_timestamp
+```
+
+| `now` vs `[start, end]` | Result |
+|------------------------|--------|
+| `now < start` | Closed (`ReportingWindowClosed` / `ClaimWindowClosed`) |
+| `now == start` | **Open** (inclusive) |
+| `start < now < end` | Open |
+| `now == end` | **Open** (inclusive) |
+| `now > end` | Closed |
+
+#### Zero-Width Windows
+
+Setting `start_timestamp == end_timestamp` is valid and creates a single-second
+eligibility slot. This is intentional but operationally fragile in production — prefer
+windows with meaningful duration (≥ 3600 seconds).
+
+#### Which Operations Are Gated
+
+| Operation | Report Window | Claim Window |
+|-----------|:---:|:---:|
+| `report_revenue` | ✅ gated | — |
+| `deposit_revenue` | — | — (never gated) |
+| `claim` | — | ✅ gated |
+
+`deposit_revenue` is **never** time-window gated. Issuers can always deposit revenue
+regardless of any configured window.
+
+#### Reconfiguration Mid-Flight
+
+Windows can be changed at any time via `set_report_window` / `set_claim_window`. The
+contract applies the window active at the **ledger that closes the transaction** — not
+at submission time. Use sufficiently wide windows to reduce reconfiguration races.
+
+#### Claim Delay vs Claim Window
+
+The per-offering `ClaimDelaySecs` (set via `set_claim_delay`) and the claim window are
+independent. The claim window is checked first; if open, the per-period delay is then
+checked inside the claim loop. Both must pass for a period to be claimable.
+
+For the full boundary matrix, zero-width window notes, and security/risk analysis see
+[docs/time-window-boundary-matrix.md](./docs/time-window-boundary-matrix.md).
+
+
+
+- **Version:** Call `get_version()` to read the current contract version (a constant, e.g., `4`). This value is bumped when storage layout or semantics change in a way that affects compatibility.
+- **Upgrade strategy:** This codebase deploys a single WASM contract; Soroban has no EVM-style proxy upgrade, so upgrades require deploying a new contract instance. Future upgrades follow this process:
   1. Deploy a new contract (new WASM) with a higher `CONTRACT_VERSION`.
-  2. Optionally run a one-time migration (e.g. admin or migration script) that reads state from the old contract and writes into the new one, or that emits migration-milestone events for indexers.
-  3. Indexers and frontends should use `get_version()` to detect the deployed version and handle schema/API differences.
-- **Migration milestones:** When a new version is deployed, integrators can treat the first transaction that succeeds on the new contract as a migration milestone; the contract does not currently emit a dedicated "migration" event, but event schemas may include a version field (e.g. v1 events) for consumers.
+  2. Optionally run a one-time migration (e.g., admin or migration script) that reads state from the old contract and writes into the new one, or that emits migration-milestone events for indexers.
+  3. **Re-point consumers:** Update all frontend, backend, and indexer configurations to use the new contract address. Indexers and custodial backends must:
+     - Update their contract address references.
+     - Check `get_version()` on the new contract to confirm the upgrade.
+     - Update event parsing and API handling logic if the new version introduces changes to event schemas or method signatures.
+     - Treat the first successful transaction on the new contract as the migration cutover point.
+  4. The old contract remains deployed but should be considered inactive; consumers should not interact with it post-migration.
+- **Migration milestones:** When a new version is deployed, integrators can treat the first transaction that succeeds on the new contract as a migration milestone; the contract does not currently emit a dedicated "migration" event, but event schemas may include a version field (e.g., v1 events) for consumers.
 
 ### Input parameter validation (#35)
 
@@ -109,16 +207,48 @@ Accepted ranges and rejection semantics:
 
 | Parameter | Entrypoint(s) | Accepted range | Error if invalid |
 |-----------|----------------|----------------|------------------|
+| `supply_cap` | `register_offering` | >= 0 | `InvalidAmount` |
 | `revenue_share_bps` | `register_offering` | 0–10000 (testnet: any) | `InvalidRevenueShareBps` |
 | `share_bps` | `set_holder_share` | 0–10000 | `InvalidShareBps` |
-| `amount` | `report_revenue` | > 0 | `InvalidAmount` |
+| `amount` | `report_revenue` | ≥ 0 | `InvalidAmount` |
 | `amount` | `deposit_revenue` | > 0 | `InvalidAmount` |
+| `amount` | `deposit_revenue_with_snapshot` | > 0 | `InvalidAmount` |
+| `snapshot_reference` | `deposit_revenue_with_snapshot` | > 0 | `InvalidAmount` |
 | `period_id` | `deposit_revenue` | > 0 | `InvalidPeriodId` |
+| `min_stake` | `set_investment_constraints` | >= 0 | `InvalidAmount` |
+| `max_stake` | `set_investment_constraints` | >= 0 and `>= min_stake` when set | `InvalidAmount` |
 | `period_id` | `report_revenue` | any u64 | — |
 | `min_amount` | `set_min_revenue_threshold` | ≥ 0 | `InvalidAmount` |
-| `fee_bps` | `set_platform_fee` | 0–5000 | `LimitReached` |
 
 Use `try_*` client methods to receive these errors as `Result`.
+Consolidated invalid-amount regression coverage lives in `src/invalid_amount_matrix_tests.rs`; the checklist is in `docs/negative-amount-validation-matrix.md`.
+This branch's public fee-related amount helper is `calculate_fee_for_asset`; it is a pure quote helper and is documented separately from the `InvalidAmount` rejection matrix.
+
+---
+
+## Local Development & Quality Gates
+
+These are the **exact** commands CI runs. Run them locally before every push.
+
+```bash
+# 1. Format check — must produce no diff
+cargo fmt --all -- --check
+
+# 2. Clippy — every warning is a hard error
+cargo clippy --all-targets --all-features -- -D warnings
+
+# 3. Build
+cargo build --release
+
+# 4. Tests — single-threaded for deterministic Soroban output
+cargo test -- --test-threads=1
+```
+
+All four checks must pass before a PR can be merged. The CI pipeline runs them as
+three sequential jobs (`fmt → clippy → test`) so failures are fast and readable.
+
+For the full rationale behind each lint gate, suppression policy, and security
+assumptions see [docs/clippy-format-gate-hardening.md](./docs/clippy-format-gate-hardening.md).
 
 ---
 
@@ -286,7 +416,7 @@ Offering Token (Address)
 
 **Integration notes:**
 - Offerings are **immutable** after registration
-- No duplicate prevention; same (issuer, token) can be registered multiple times with different indices
+- **Duplicate prevention:** Registration is idempotent; re-registering the same `(issuer, namespace, token)` is a no-op that returns `Ok(())`, preserving the original registration's parameters.
 - Off-chain systems should track registration events to build offering directories
 
 ---
@@ -302,7 +432,7 @@ Offering Token (Address)
    ├─ Validate:
    │    ├─ Offering exists (get_offering)
    │    ├─ Period not already deposited (PeriodRevenue not set)
-   │    └─ Payment token matches previous deposits (if any)
+   │    └─ Payment token matches the stored lock (if a previous successful deposit exists)
    ├─ Token transfer: payment_token.transfer(issuer → contract, amount)
    └─ State changes:
         ├─ Write: PeriodRevenue(token, period_id) = amount
@@ -310,7 +440,7 @@ Offering Token (Address)
         ├─ Read: PeriodCount(token) → count
         ├─ Write: PeriodEntry(token, count) = period_id
         ├─ Write: PeriodCount(token) = count + 1
-        ├─ Write (once): PaymentToken(token) = payment_token (if first deposit)
+        ├─ Write (once): PaymentToken(token) = payment_token (after the first successful deposit)
         └─ Event: rev_dep(issuer, token, (payment_token, amount, period_id))
 
 2. Result: Holders can now claim this period via claim()
@@ -323,11 +453,12 @@ Offering Token (Address)
 **Error conditions:**
 - `OfferingNotFound`: No offering exists for (issuer, token)
 - `PeriodAlreadyDeposited`: Period already has revenue deposited
-- `PaymentTokenMismatch`: Different payment token than previous deposits
+- `PaymentTokenMismatch`: Different payment token than the token locked by the first successful deposit
 - `ContractFrozen`: Contract is frozen
 
 **Integration notes:**
-- **Payment token is locked** on first deposit; all subsequent deposits must use the same token
+- **Payment token is locked only after a successful first deposit**; failed deposits do not set `PaymentToken`
+- **Duplicate period IDs fail as `PeriodAlreadyDeposited`** before any sequencing state is updated
 - **Period IDs are arbitrary** (u64); issuers can use timestamps, sequential numbers, or any scheme
 - **Period order matters**: Claims are processed in deposit order (via PeriodEntry index), not period_id order
 
@@ -346,9 +477,14 @@ Offering Token (Address)
    │    ├─ Read: CurrentConcentration(issuer, token)
    │    └─ If enforce && current > max_bps → Err(ConcentrationLimitExceeded)
    ├─ Read: Blacklist(token) → blacklist_vec
-   ├─ Event: rev_rep((issuer, token), (amount, period_id, blacklist_vec))
-   └─ State changes:
-        ├─ Read: AuditSummary(issuer, token) → summary
+   ├─ If existing period and !override_existing:
+   │    └─ Emit: rev_rej(...), no state change
+   ├─ If existing period and override_existing:
+   │    ├─ Emit: rev_ovrd(...)
+   │    └─ Update: summary.total_revenue += (new_amount - old_amount)
+   └─ If new period:
+        ├─ If amount < min_threshold → emit rev_below(...), no state change
+        ├─ Emit: rev_init(...) then rev_rep(...)
         ├─ Update: summary.total_revenue += amount
         ├─ Update: summary.report_count += 1
         └─ Write: AuditSummary(issuer, token) = summary
@@ -810,8 +946,8 @@ If holder calls claim() at t=90000:
 **Structure:**
 ```rust
 pub struct AuditSummary {
-    pub total_revenue: i128,    // Sum of all report_revenue() calls
-    pub report_count: u64,      // Number of report_revenue() calls
+    pub total_revenue: i128,    // Sum of persisted reports after override deltas
+    pub report_count: u64,      // Number of persisted periods
 }
 ```
 
@@ -831,12 +967,13 @@ let discrepancy = summary.total_revenue - total_deposited;
 **Audit patterns:**
 ```
 1. Consistency check:
-   For each period_id in rev_rep events:
-     Verify corresponding rev_dep event exists
-     Alert if reported amount != deposited amount
+   For each period_id in rev_init / rev_ovrd events:
+     Verify the latest reported amount matches your expected deposited or accounted value
+     Alert if an override changes a period without a corresponding off-chain explanation
 
 2. Completeness check:
-   Sum(all rev_dep amounts) should approximate sum(all rev_rep amounts)
+   Start from all rev_init amounts, then apply each rev_ovrd delta `(new - old)`
+   Compare the reconstructed total to `get_audit_summary` / `reconcile_audit_summary`
    Investigate significant discrepancies
 
 3. Compliance reporting:
@@ -1368,7 +1505,7 @@ Offering Token (Address)
         ├─ Read: PeriodCount(token) → count
         ├─ Write: PeriodEntry(token, count) = period_id
         ├─ Write: PeriodCount(token) = count + 1
-        ├─ Write (once): PaymentToken(token) = payment_token (if first deposit)
+        ├─ Write (once): PaymentToken(token) = payment_token (after the first successful deposit)
         └─ Event: rev_dep(issuer, token, (payment_token, amount, period_id))
 
 2. Result: Holders can now claim this period via claim()
@@ -1381,11 +1518,12 @@ Offering Token (Address)
 **Error conditions:**
 - `OfferingNotFound`: No offering exists for (issuer, token)
 - `PeriodAlreadyDeposited`: Period already has revenue deposited
-- `PaymentTokenMismatch`: Different payment token than previous deposits
+- `PaymentTokenMismatch`: Different payment token than the token locked by the first successful deposit
 - `ContractFrozen`: Contract is frozen
 
 **Integration notes:**
-- **Payment token is locked** on first deposit; all subsequent deposits must use the same token
+- **Payment token is locked only after a successful first deposit**; failed deposits do not set `PaymentToken`
+- **Duplicate period IDs fail as `PeriodAlreadyDeposited`** before any sequencing state is updated
 - **Period IDs are arbitrary** (u64); issuers can use timestamps, sequential numbers, or any scheme
 - **Period order matters**: Claims are processed in deposit order (via PeriodEntry index), not period_id order
 
@@ -1868,8 +2006,8 @@ If holder calls claim() at t=90000:
 **Structure:**
 ```rust
 pub struct AuditSummary {
-    pub total_revenue: i128,    // Sum of all report_revenue() calls
-    pub report_count: u64,      // Number of report_revenue() calls
+    pub total_revenue: i128,    // Sum of persisted reports after override deltas
+    pub report_count: u64,      // Number of persisted periods
 }
 ```
 
@@ -1889,12 +2027,13 @@ let discrepancy = summary.total_revenue - total_deposited;
 **Audit patterns:**
 ```
 1. Consistency check:
-   For each period_id in rev_rep events:
-     Verify corresponding rev_dep event exists
-     Alert if reported amount != deposited amount
+   For each period_id in rev_init / rev_ovrd events:
+     Verify the latest accepted reported amount matches expected accounting
+     Alert if a correction changes a period without the matching off-chain justification
 
 2. Completeness check:
-   Sum(all rev_dep amounts) should approximate sum(all rev_rep amounts)
+   Reconstruct totals as sum(rev_init) + sum(rev_ovrd.new_amount - rev_ovrd.old_amount)
+   Compare the result to get_audit_summary / reconcile_audit_summary
    Investigate significant discrepancies
 
 3. Compliance reporting:
@@ -2248,7 +2387,7 @@ This section enumerates key security assumptions, trust boundaries, and mitigati
 - **Blacklist authority:** Only the current issuer of the offering can add/remove blacklist entries for that offering's token. This ensures issuers have full control over compliance and investor management.
 - **Concentration data:** Holder concentration is not derived on-chain. The contract trusts the value passed to `report_concentration`. Enforcing or warning is based on this reported value; manipulation of the reported value can bypass the guardrail.
 - **Revenue reports:** The contract does not verify that reported revenue amounts are correct or consistent with any external source. It only records and aggregates them for the audit summary and emits events.
-- **Zero-value revenue policy:** Revenue reports and deposits must have positive amounts (> 0). Zero or negative amounts are rejected to prevent invalid reports and ensure meaningful audit trails.
+- **Zero-value revenue policy:** `deposit_revenue` requires a positive amount, but `report_revenue` allows zero so issuers can preserve an explicit on-chain audit record for a period even when the final reported amount is zero.
 
 ### Threat model and mitigations
 
@@ -2257,9 +2396,9 @@ This section enumerates key security assumptions, trust boundaries, and mitigati
 | **Auth misuse / wrong signer** | All state-changing entrypoints call `require_auth` on the appropriate address. Auth failures cause host panic; use `try_*` client methods to handle errors. Issuer-only enforcement for blacklist operations. Tests: `blacklist_add_requires_auth`, `blacklist_remove_requires_auth`, `blacklist_add_requires_issuer_auth`, `blacklist_remove_requires_issuer_auth`. |
 | **Issuer transfer security** | Two-step propose/accept flow prevents accidental loss of control. Old issuer must propose, new issuer must explicitly accept. Either can abort (old cancels, new doesn't accept). Current issuer verified via reverse lookup on all auth checks. Tests: `issuer_transfer_*` (35 tests covering happy path, abuse attempts, edge cases, and integration). |
 | **Incorrect math (overflow, rounding)** | Revenue share bps is capped at 10000. `compute_share` uses checked arithmetic where applicable and clamps output to [0, amount]. Rounding modes (Truncation, RoundHalfUp) are documented and tested. Tests: `compute_share_*`, `register_offering_rejects_bps_over_10000`. |
-| **Invalid revenue amounts** | Zero-value revenue policy rejects amounts ≤ 0 for both deposits and reports. Prevents spam reports and ensures positive revenue flows. Tests: `zero_amount_revenue_report_rejected`, `negative_amount_revenue_report_rejected`, `deposit_revenue_rejects_zero_amount`, `deposit_revenue_rejects_negative_amount`. |
+| **Invalid revenue amounts** | Deposits reject amounts ≤ 0; reports reject negatives but allow zero-value audit entries. This preserves explicit audit history without letting transfers carry empty or negative amounts. |
 | **Concentration guardrail bypass** | Enforcement is applied in `report_revenue` using the last value set by `report_concentration`. If concentration is not reported or is reported low, enforcement cannot block. Design: guardrail is advisory or best-effort unless the issuer reliably reports concentration before each report. Tests: concentration_enforce_blocks_report_revenue_when_over_limit, concentration_near_threshold_boundary. |
-| **Audit summary consistency** | Summary is updated atomically in `report_revenue` (total_revenue += amount, report_count += 1). No corrections or overrides are supported; each report is additive. Tests: audit_summary_aggregates_revenue_and_count, audit_summary_per_offering_isolation. |
+| **Audit summary consistency** | `AuditSummary` is derived from persisted report state. Initial reports add `(amount, +1)`, overrides add the net delta `(new - old, +0)`, rejected duplicates and `rev_below` no-ops do not mutate the summary, and `reconcile_audit_summary` / `repair_audit_summary` are available if drift is detected. |
 | **Storage / gas exhaustion** | Large blacklists and many offerings increase read/write cost. Pagination (max 20 per page) and stress tests document behavior. No unbounded loops over user-controlled collections except the blacklist map (bounded by who is added). Tests: storage_stress_*, gas_characterization_*. |
 | **Upgradeability** | The contract is not upgradeable in this codebase; deployment is a single WASM with no proxy pattern. Any upgrade would require a new deployment and migration of off-chain indexing. |
 
