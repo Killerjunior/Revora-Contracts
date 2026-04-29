@@ -107,23 +107,27 @@ pub fn arb_strictly_increasing_periods(len: usize) -> impl Strategy<Value = Vec<
 #[derive(Debug, Clone)]
 pub enum TestOperation {
     /// `register_offering(issuer, namespace, token, bps, payout_asset, supply_cap)`
-    RegisterOffering { bps: u32, supply_cap: i128 },
+    RegisterOffering { issuer: Address, namespace: Symbol, token: Address, bps: u32, payout_asset: Address, supply_cap: i128 },
     /// `report_revenue(issuer, namespace, token, payout_asset, amount, period_id, override_existing)`
-    ReportRevenue { amount: i128, period_id: u64, override_existing: bool },
+    ReportRevenue { issuer: Address, namespace: Symbol, token: Address, payout_asset: Address, amount: i128, period_id: u64, override_existing: bool },
     /// `deposit_revenue(issuer, namespace, token, payment_token, amount, period_id)`
-    DepositRevenue { amount: i128, period_id: u64 },
-    /// `set_holder_share(issuer, namespace, token, holder_index, share_bps)`
-    SetHolderShare { holder_index: u8, share_bps: u32 },
-    /// `blacklist_add(caller, issuer, namespace, token, target_index)`
-    BlacklistAdd { target_index: u8 },
-    /// `blacklist_remove(caller, issuer, namespace, token, target_index)`
-    BlacklistRemove { target_index: u8 },
+    DepositRevenue { issuer: Address, namespace: Symbol, token: Address, payment_token: Address, amount: i128, period_id: u64 },
+    /// `set_holder_share(issuer, namespace, token, holder, share_bps)`
+    SetHolderShare { issuer: Address, namespace: Symbol, token: Address, holder: Address, share_bps: u32 },
+    /// `blacklist_add(caller, issuer, namespace, token, investor)`
+    BlacklistAdd { caller: Address, issuer: Address, namespace: Symbol, token: Address, investor: Address },
+    /// `blacklist_remove(caller, issuer, namespace, token, investor)`
+    BlacklistRemove { caller: Address, issuer: Address, namespace: Symbol, token: Address, investor: Address },
     /// `set_concentration_limit(issuer, namespace, token, max_bps, enforce)`
     SetConcentrationLimit { max_bps: u32, enforce: bool },
+    /// `report_concentration(issuer, namespace, token, concentration_bps)`
+    ReportConcentration { concentration_bps: u32 },
     /// `freeze()` — admin-only global freeze
     Freeze,
+    /// `pause_admin(caller)` — admin-only pause
+    Pause { caller: Address },
     /// `set_claim_delay(issuer, namespace, token, delay_secs)`
-    SetClaimDelay { delay_secs: u64 },
+    SetClaimDelay { issuer: Address, namespace: Symbol, token: Address, delay_secs: u64 },
 }
 
 // ── Operation strategies ─────────────────────────────────────────────────────
@@ -173,6 +177,11 @@ pub fn arb_set_concentration_limit() -> impl Strategy<Value = TestOperation> {
         .prop_map(|(max_bps, enforce)| TestOperation::SetConcentrationLimit { max_bps, enforce })
 }
 
+/// Strategy for a single `ReportConcentration` operation.
+pub fn arb_report_concentration() -> impl Strategy<Value = TestOperation> {
+    arb_valid_bps().prop_map(|concentration_bps| TestOperation::ReportConcentration { concentration_bps })
+}
+
 /// Strategy for any single valid operation (uniform distribution).
 pub fn arb_any_operation() -> impl Strategy<Value = TestOperation> {
     prop_oneof![
@@ -183,6 +192,7 @@ pub fn arb_any_operation() -> impl Strategy<Value = TestOperation> {
         arb_blacklist_add(),
         arb_blacklist_remove(),
         arb_set_concentration_limit(),
+        arb_report_concentration(),
         Just(TestOperation::Freeze),
         (0u64..=3600u64).prop_map(|d| TestOperation::SetClaimDelay { delay_secs: d }),
     ]
