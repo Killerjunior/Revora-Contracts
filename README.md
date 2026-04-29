@@ -214,10 +214,10 @@ Accepted ranges and rejection semantics:
 | `amount` | `deposit_revenue` | > 0 | `InvalidAmount` |
 | `amount` | `deposit_revenue_with_snapshot` | > 0 | `InvalidAmount` |
 | `snapshot_reference` | `deposit_revenue_with_snapshot` | > 0 | `InvalidAmount` |
-| `period_id` | `deposit_revenue` | > 0 | `InvalidPeriodId` |
+| `period_id` | `deposit_revenue` | `> 0`, `last + 1`, and non-duplicate | `InvalidPeriodId` (0/gap), `PeriodAlreadyDeposited` (dup) |
 | `min_stake` | `set_investment_constraints` | >= 0 | `InvalidAmount` |
 | `max_stake` | `set_investment_constraints` | >= 0 and `>= min_stake` when set | `InvalidAmount` |
-| `period_id` | `report_revenue` | any u64 | — |
+| `period_id` | `report_revenue` | `> 0` and `last + 1` (for new reports) | `InvalidPeriodId` |
 | `min_amount` | `set_min_revenue_threshold` | ≥ 0 | `InvalidAmount` |
 
 Use `try_*` client methods to receive these errors as `Result`.

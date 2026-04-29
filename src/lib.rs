@@ -1241,9 +1241,6 @@ impl RevoraRevenueShare {
 
         let last_period_key = DataKey2::LastDepositedPeriodId(offering_id.clone());
 
-        // Enforce deposit-period ordering without mutating state on failed attempts.
-        Self::require_next_period_id(env, last_period_key.clone(), period_id)?;
-
         // Check period not already deposited
         let rev_key = DataKey::PeriodRevenue(offering_id.clone(), period_id);
         if env.storage().persistent().has(&rev_key) {
@@ -1252,7 +1249,7 @@ impl RevoraRevenueShare {
 
         // Enforce period ordering invariant only after duplicate detection so repeated
         // deposits fail with the period-specific error rather than a generic sequence error.
-        Self::validate_next_period_id(env, &offering_id, period_id)?;
+        Self::require_next_period_id(env, last_period_key.clone(), period_id)?;
 
         // Supply cap check (#96): reject if deposit would exceed cap
         let cap_key = DataKey::SupplyCap(offering_id.clone());
@@ -1869,6 +1866,11 @@ impl RevoraRevenueShare {
         Self::require_not_frozen(&env)?;
         Self::require_not_paused(&env)?;
         issuer.require_auth();
+
+        // Input validation (#35): reject zero/invalid period_id
+        if period_id == 0 {
+            return Err(RevoraError::InvalidPeriodId);
+        }
 
         // Negative Amount Validation Matrix: RevenueReport requires amount >= 0 (#163)
         if let Err((err, reason)) =
