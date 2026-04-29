@@ -1098,6 +1098,152 @@ impl RevoraRevenueShare {
         env.storage().persistent().get(&DataKey::SupplyCap(offering_id)).unwrap_or(0)
     }
 
+    // ── Fee BPS Configuration (#98) ──────────────────────────────────────────
+
+    /// Set the global platform fee in basis points. Admin-only. (#98)
+    ///
+    /// Emits `EVENT_PLATFORM_FEE_SET` with the new `fee_bps` value.
+    ///
+    /// ### Errors
+    /// - `NotInitialized` — contract not yet initialized.
+    /// - `InvalidRevenueShareBps` — `fee_bps` exceeds `MAX_PLATFORM_FEE_BPS` (5 000).
+    pub fn set_platform_fee(env: Env, fee_bps: u32) -> Result<(), RevoraError> {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(RevoraError::NotInitialized)?;
+        admin.require_auth();
+        if fee_bps > MAX_PLATFORM_FEE_BPS {
+            return Err(RevoraError::InvalidRevenueShareBps);
+        }
+        env.storage().persistent().set(&DataKey::PlatformFeeBps, &fee_bps);
+        env.events().publish((EVENT_PLATFORM_FEE_SET,), fee_bps);
+        Ok(())
+    }
+
+    /// Return the global platform fee in basis points (0 = no fee). (#98)
+    ///
+    /// O(1) — single persistent storage read.
+    pub fn get_platform_fee(env: Env) -> u32 {
+        env.storage().persistent().get(&DataKey::PlatformFeeBps).unwrap_or(0)
+    }
+
+    /// Calculate the platform fee for `amount` using the stored global platform fee BPS. (#98)
+    ///
+    /// O(1) — one storage read plus integer arithmetic; no storage writes.
+    pub fn calculate_platform_fee(env: Env, amount: i128) -> i128 {
+        let fee_bps: i128 = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::PlatformFeeBps)
+            .unwrap_or(0) as i128;
+        (amount * fee_bps).checked_div(BPS_DENOMINATOR).unwrap_or(0)
+    }
+
+    /// Set a per-offering per-asset fee override in basis points. Issuer-only. (#98)
+    ///
+    /// Emits `EVENT_FEE_CONFIG` with `(issuer, namespace, token, asset, fee_bps)`.
+    ///
+    /// ### Errors
+    /// - `OfferingNotFound` — offering does not exist or caller is not the issuer.
+    /// - `InvalidRevenueShareBps` — `fee_bps` exceeds `MAX_PLATFORM_FEE_BPS` (5 000).
+    pub fn set_offering_fee_bps(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        asset: Address,
+        fee_bps: u32,
+    ) -> Result<(), RevoraError> {
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+        issuer.require_auth();
+        if fee_bps > MAX_PLATFORM_FEE_BPS {
+            return Err(RevoraError::InvalidRevenueShareBps);
+        }
+        let offering_id =
+            OfferingId { issuer: issuer.clone(), namespace: namespace.clone(), token: token.clone() };
+        env.storage()
+            .persistent()
+            .set(&DataKey::OfferingFeeBps(offering_id, asset.clone()), &fee_bps);
+        env.events()
+            .publish((EVENT_FEE_CONFIG, issuer, namespace, token, asset), fee_bps);
+        Ok(())
+    }
+
+    /// Return the per-offering per-asset fee override in basis points (0 = use platform default). (#98)
+    ///
+    /// O(1) — single persistent storage read.
+    pub fn get_offering_fee_bps(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        asset: Address,
+    ) -> u32 {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get(&DataKey::OfferingFeeBps(offering_id, asset))
+            .unwrap_or(0)
+    }
+
+    /// Set a platform-level per-asset fee in basis points. Admin-only. (#98)
+    ///
+    /// Emits `EVENT_FEE_CONFIG` with `(asset, fee_bps)`.
+    ///
+    /// ### Errors
+    /// - `NotInitialized` — contract not yet initialized.
+    /// - `InvalidRevenueShareBps` — `fee_bps` exceeds `MAX_PLATFORM_FEE_BPS` (5 000).
+    pub fn set_platform_fee_per_asset(
+        env: Env,
+        asset: Address,
+        fee_bps: u32,
+    ) -> Result<(), RevoraError> {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(RevoraError::NotInitialized)?;
+        admin.require_auth();
+        if fee_bps > MAX_PLATFORM_FEE_BPS {
+            return Err(RevoraError::InvalidRevenueShareBps);
+        }
+        env.storage().persistent().set(&DataKey::PlatformFeePerAsset(asset.clone()), &fee_bps);
+        env.events().publish((EVENT_FEE_CONFIG, asset), fee_bps);
+        Ok(())
+    }
+
+    /// Return the platform-level per-asset fee in basis points (0 = no per-asset override). (#98)
+    ///
+    /// O(1) — single persistent storage read.
+    pub fn get_platform_fee_per_asset(env: Env, asset: Address) -> u32 {
+        env.storage().persistent().get(&DataKey::PlatformFeePerAsset(asset)).unwrap_or(0)
+    }
+
+    /// Resolve the effective fee BPS for a given offering and payment asset. (#98)
+    ///
+    /// Resolution hierarchy (first match wins — O(1) per level):
+    ///   1. Per-offering per-asset override (`OfferingFeeBps`)
+    ///   2. Platform-wide per-asset fee (`PlatformFeePerAsset`)
+    ///   3. Global platform fee (`PlatformFeeBps`)
+    fn get_effective_fee_bps(env: &Env, offering_id: &OfferingId, asset: &Address) -> u32 {
+        let offering_key = DataKey::OfferingFeeBps(offering_id.clone(), asset.clone());
+        if let Some(bps) = env.storage().persistent().get::<DataKey, u32>(&offering_key) {
+            return bps;
+        }
+        let asset_key = DataKey::PlatformFeePerAsset(asset.clone());
+        if let Some(bps) = env.storage().persistent().get::<DataKey, u32>(&asset_key) {
+            return bps;
+        }
+        env.storage().persistent().get(&DataKey::PlatformFeeBps).unwrap_or(0)
+    }
+
     /// Return true if the contract is in event-only mode.
     pub fn is_event_only(env: &Env) -> bool {
         let (_, event_only): (bool, bool) =
@@ -4977,10 +5123,35 @@ impl RevenueDepositContract {
                 map.set(id, unclaimed);
             }
         }
+        map
+    }
+
+    /// Resolve the effective fee BPS for a given offering and payment asset. (#98)
+    ///
+    /// Resolution hierarchy (first match wins — O(1) per level):
+    ///   1. Per-offering per-asset override (`OfferingFeeBps`)
+    ///   2. Platform-wide per-asset fee (`PlatformFeePerAsset`)
+    ///   3. Global platform fee (`PlatformFeeBps`)
+    fn get_effective_fee_bps(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        asset: Address,
+    ) -> u32 {
+        let offering_id = OfferingId { issuer, namespace, token };
+        let offering_key = DataKey::OfferingFeeBps(offering_id, asset.clone());
+        if let Some(bps) = env.storage().persistent().get::<DataKey, u32>(&offering_key) {
+            return bps;
+        }
+        let asset_key = DataKey::PlatformFeePerAsset(asset);
+        if let Some(bps) = env.storage().persistent().get::<DataKey, u32>(&asset_key) {
+            return bps;
+        }
         env.storage().persistent().get(&DataKey::PlatformFeeBps).unwrap_or(0)
     }
 
-    /// Calculate fee for (offering, asset, amount) using effective fee bps.
+    /// Calculate fee for (offering, asset, amount) using effective fee bps. (#98)
     pub fn calculate_fee_for_asset(
         env: Env,
         issuer: Address,

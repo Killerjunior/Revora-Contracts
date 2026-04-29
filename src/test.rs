@@ -6596,6 +6596,283 @@ mod regression {
     }
 
     // ---------------------------------------------------------------------------
+    // Fee BPS: per-offering and per-asset settings, EVENT_FEE_CONFIG, upper bounds
+    // (#98, RC26Q2-C20) — Issue #269
+    // ---------------------------------------------------------------------------
+
+    /// Helper: initialise a fresh contract with one registered offering.
+    /// Returns (client, issuer/admin, token, payout_asset).
+    fn setup_fee_offering(
+        env: &Env,
+    ) -> (RevoraRevenueShareClient, Address, Address, Address) {
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        let token = Address::generate(env);
+        let payout_asset = Address::generate(env);
+        client.initialize(&admin, &None::<Address>, &None::<bool>);
+        client.register_offering(
+            &admin,
+            &symbol_short!("fee"),
+            &token,
+            &1_000,
+            &payout_asset,
+            &0,
+        );
+        (client, admin, token, payout_asset)
+    }
+
+    // ── EVENT_PLATFORM_FEE_SET emission ──────────────────────────────────────
+
+    #[test]
+    fn platform_fee_set_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &None::<Address>, &None::<bool>);
+
+        let before = env.events().all().len();
+        client.set_platform_fee(&300);
+        assert!(
+            env.events().all().len() > before,
+            "EVENT_PLATFORM_FEE_SET must be emitted on set_platform_fee"
+        );
+    }
+
+    #[test]
+    fn platform_fee_reconfigure_emits_event_each_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &None::<Address>, &None::<bool>);
+
+        let before = env.events().all().len();
+        client.set_platform_fee(&100);
+        client.set_platform_fee(&200);
+        // Two mutation calls must each emit at least one event.
+        assert!(
+            env.events().all().len() >= before + 2,
+            "each set_platform_fee call must emit its own event"
+        );
+    }
+
+    // ── Boundary BPS for platform fee ────────────────────────────────────────
+
+    #[test]
+    fn platform_fee_boundary_one_bps_accepted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &None::<Address>, &None::<bool>);
+        client.set_platform_fee(&1);
+        assert_eq!(client.get_platform_fee(), 1);
+    }
+
+    #[test]
+    fn platform_fee_boundary_4999_bps_accepted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &None::<Address>, &None::<bool>);
+        client.set_platform_fee(&4_999);
+        assert_eq!(client.get_platform_fee(), 4_999);
+    }
+
+    // ── Per-offering per-asset fee override ──────────────────────────────────
+
+    #[test]
+    fn offering_fee_bps_default_is_zero() {
+        let env = Env::default();
+        let (client, issuer, token, payout_asset) = setup_fee_offering(&env);
+        assert_eq!(
+            client.get_offering_fee_bps(&issuer, &symbol_short!("fee"), &token, &payout_asset),
+            0
+        );
+    }
+
+    #[test]
+    fn set_offering_fee_bps_stores_and_retrieves() {
+        let env = Env::default();
+        let (client, issuer, token, payout_asset) = setup_fee_offering(&env);
+        client.set_offering_fee_bps(&issuer, &symbol_short!("fee"), &token, &payout_asset, &200);
+        assert_eq!(
+            client.get_offering_fee_bps(&issuer, &symbol_short!("fee"), &token, &payout_asset),
+            200
+        );
+    }
+
+    #[test]
+    fn set_offering_fee_bps_emits_fee_config_event() {
+        let env = Env::default();
+        let (client, issuer, token, payout_asset) = setup_fee_offering(&env);
+        let before = env.events().all().len();
+        client.set_offering_fee_bps(&issuer, &symbol_short!("fee"), &token, &payout_asset, &150);
+        assert!(
+            env.events().all().len() > before,
+            "EVENT_FEE_CONFIG must be emitted on set_offering_fee_bps"
+        );
+    }
+
+    #[test]
+    fn set_offering_fee_bps_at_maximum_boundary_succeeds() {
+        let env = Env::default();
+        let (client, issuer, token, payout_asset) = setup_fee_offering(&env);
+        client.set_offering_fee_bps(&issuer, &symbol_short!("fee"), &token, &payout_asset, &5_000);
+        assert_eq!(
+            client.get_offering_fee_bps(&issuer, &symbol_short!("fee"), &token, &payout_asset),
+            5_000
+        );
+    }
+
+    #[test]
+    fn set_offering_fee_bps_above_maximum_fails() {
+        let env = Env::default();
+        let (client, issuer, token, payout_asset) = setup_fee_offering(&env);
+        let result = client.try_set_offering_fee_bps(
+            &issuer,
+            &symbol_short!("fee"),
+            &token,
+            &payout_asset,
+            &5_001,
+        );
+        assert!(result.is_err(), "fee_bps > MAX_PLATFORM_FEE_BPS (5 000) must be rejected");
+    }
+
+    #[test]
+    fn set_offering_fee_bps_fails_for_nonexistent_offering() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        let asset = Address::generate(&env);
+        client.initialize(&admin, &None::<Address>, &None::<bool>);
+        // Offering not registered — must return OfferingNotFound.
+        let result = client.try_set_offering_fee_bps(
+            &admin,
+            &symbol_short!("fee"),
+            &token,
+            &asset,
+            &100,
+        );
+        assert!(result.is_err(), "must fail when offering does not exist");
+    }
+
+    #[test]
+    fn set_offering_fee_bps_reconfigure_replaces_previous() {
+        let env = Env::default();
+        let (client, issuer, token, payout_asset) = setup_fee_offering(&env);
+        client.set_offering_fee_bps(&issuer, &symbol_short!("fee"), &token, &payout_asset, &100);
+        client.set_offering_fee_bps(&issuer, &symbol_short!("fee"), &token, &payout_asset, &999);
+        assert_eq!(
+            client.get_offering_fee_bps(&issuer, &symbol_short!("fee"), &token, &payout_asset),
+            999,
+            "second set_offering_fee_bps must overwrite first"
+        );
+    }
+
+    // ── Platform-level per-asset fee ─────────────────────────────────────────
+
+    #[test]
+    fn platform_fee_per_asset_default_is_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let asset = Address::generate(&env);
+        client.initialize(&admin, &None::<Address>, &None::<bool>);
+        assert_eq!(client.get_platform_fee_per_asset(&asset), 0);
+    }
+
+    #[test]
+    fn set_platform_fee_per_asset_stores_and_retrieves() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let asset = Address::generate(&env);
+        client.initialize(&admin, &None::<Address>, &None::<bool>);
+        client.set_platform_fee_per_asset(&asset, &400);
+        assert_eq!(client.get_platform_fee_per_asset(&asset), 400);
+    }
+
+    #[test]
+    fn set_platform_fee_per_asset_emits_fee_config_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let asset = Address::generate(&env);
+        client.initialize(&admin, &None::<Address>, &None::<bool>);
+        let before = env.events().all().len();
+        client.set_platform_fee_per_asset(&asset, &300);
+        assert!(
+            env.events().all().len() > before,
+            "EVENT_FEE_CONFIG must be emitted on set_platform_fee_per_asset"
+        );
+    }
+
+    #[test]
+    fn set_platform_fee_per_asset_above_maximum_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let asset = Address::generate(&env);
+        client.initialize(&admin, &None::<Address>, &None::<bool>);
+        let result = client.try_set_platform_fee_per_asset(&asset, &5_001);
+        assert!(result.is_err(), "fee_bps > MAX_PLATFORM_FEE_BPS must be rejected");
+    }
+
+    #[test]
+    fn set_platform_fee_per_asset_zero_and_max_boundary() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let asset = Address::generate(&env);
+        client.initialize(&admin, &None::<Address>, &None::<bool>);
+        // Max boundary.
+        client.set_platform_fee_per_asset(&asset, &5_000);
+        assert_eq!(client.get_platform_fee_per_asset(&asset), 5_000);
+        // Reset to zero.
+        client.set_platform_fee_per_asset(&asset, &0);
+        assert_eq!(client.get_platform_fee_per_asset(&asset), 0);
+    }
+
+    #[test]
+    fn per_asset_fees_are_independent_across_different_assets() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let asset_a = Address::generate(&env);
+        let asset_b = Address::generate(&env);
+        client.initialize(&admin, &None::<Address>, &None::<bool>);
+        client.set_platform_fee_per_asset(&asset_a, &100);
+        client.set_platform_fee_per_asset(&asset_b, &200);
+        // Setting one asset's fee must not affect the other.
+        assert_eq!(client.get_platform_fee_per_asset(&asset_a), 100);
+        assert_eq!(client.get_platform_fee_per_asset(&asset_b), 200);
+    }
+
+    // ---------------------------------------------------------------------------
     // Per-offering minimum revenue thresholds (#25)
     // ---------------------------------------------------------------------------
 
