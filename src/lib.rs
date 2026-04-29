@@ -1481,6 +1481,232 @@ impl RevoraRevenueShare {
         env.storage().persistent().get(&key)
     }
 
+    fn ensure_issuer_registered(env: &Env, issuer: &Address) {
+        let issuer_key = DataKey2::IssuerRegistered(issuer.clone());
+        if !env.storage().persistent().has(&issuer_key) {
+            let count: u32 = env.storage().persistent().get(&DataKey2::IssuerCount).unwrap_or(0);
+            env.storage().persistent().set(&DataKey2::IssuerItem(count), issuer);
+            env.storage().persistent().set(&DataKey2::IssuerCount, &(count + 1));
+            env.storage().persistent().set(&issuer_key, &true);
+        }
+    }
+
+    fn ensure_namespace_registered(env: &Env, issuer: &Address, namespace: &Symbol) {
+        let ns_key = DataKey2::NamespaceRegistered(issuer.clone(), namespace.clone());
+        if !env.storage().persistent().has(&ns_key) {
+            let ns_count: u32 = env.storage().persistent().get(&DataKey2::NamespaceCount(issuer.clone())).unwrap_or(0);
+            env.storage().persistent().set(&DataKey2::NamespaceItem(issuer.clone(), ns_count), namespace);
+            env.storage().persistent().set(&DataKey2::NamespaceCount(issuer.clone()), &(ns_count + 1));
+            env.storage().persistent().set(&ns_key, &true);
+        }
+    }
+
+    fn is_testnet_mode(env: Env) -> bool {
+        env.storage().persistent().get::<DataKey, bool>(&DataKey::TestnetMode).unwrap_or(false)
+    }
+
+    pub fn set_testnet_mode(env: Env, enabled: bool) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        let admin: Address = env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::TestnetMode, &enabled);
+        env.events().publish((EVENT_TESTNET_MODE,), enabled);
+        Ok(())
+    }
+
+    pub fn get_pending_issuer_transfer(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Option<Address> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get::<DataKey, PendingTransfer>(&DataKey::PendingIssuerTransfer(offering_id))
+            .map(|pending| pending.new_issuer)
+    }
+
+    fn find_pending_transfer_for_new_issuer(
+        env: &Env,
+        namespace: &Symbol,
+        token: &Address,
+        new_issuer: &Address,
+    ) -> Option<OfferingId> {
+        let issuer_count: u32 = env.storage().persistent().get(&DataKey2::IssuerCount).unwrap_or(0);
+        for i in 0..issuer_count {
+            let issuer: Address = env.storage().persistent().get(&DataKey2::IssuerItem(i)).unwrap();
+            let ns_count: u32 = env.storage().persistent().get(&DataKey2::NamespaceCount(issuer.clone())).unwrap_or(0);
+            for j in 0..ns_count {
+                let namespace_item: Symbol = env.storage().persistent().get(&DataKey2::NamespaceItem(issuer.clone(), j)).unwrap();
+                if namespace_item != *namespace {
+                    continue;
+                }
+                let offering_id = OfferingId {
+                    issuer: issuer.clone(),
+                    namespace: namespace_item.clone(),
+                    token: token.clone(),
+                };
+                if let Some(pending) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, PendingTransfer>(&DataKey::PendingIssuerTransfer(offering_id.clone()))
+                {
+                    if pending.new_issuer == *new_issuer {
+                        return Some(offering_id);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn propose_issuer_transfer(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        new_issuer: Address,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
+        issuer.require_auth();
+
+        let offering_id = OfferingId { issuer: issuer.clone(), namespace: namespace.clone(), token: token.clone() };
+        let current_issuer = Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+            .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
+        let key = DataKey::PendingIssuerTransfer(offering_id.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(RevoraError::IssuerTransferPending);
+        }
+
+        let timestamp = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&key, &PendingTransfer { new_issuer: new_issuer.clone(), timestamp });
+        env.events().publish(
+            (EVENT_ISSUER_TRANSFER_PROPOSED, issuer.clone(), namespace.clone(), token.clone()),
+            (new_issuer.clone(), timestamp),
+        );
+        Ok(())
+    }
+
+    pub fn accept_issuer_transfer(
+        env: Env,
+        new_issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
+        new_issuer.require_auth();
+
+        let offering_id = Self::find_pending_transfer_for_new_issuer(&env, &namespace, &token, &new_issuer)
+            .ok_or(RevoraError::NoTransferPending)?;
+
+        let pending: PendingTransfer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingIssuerTransfer(offering_id.clone()))
+            .ok_or(RevoraError::NoTransferPending)?;
+
+        let current_timestamp = env.ledger().timestamp();
+        if current_timestamp > pending.timestamp.saturating_add(ISSUER_TRANSFER_EXPIRY_SECS) {
+            return Err(RevoraError::IssuerTransferExpired);
+        }
+
+        let old_issuer = offering_id.issuer.clone();
+
+        if new_issuer == old_issuer {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::PendingIssuerTransfer(offering_id.clone()));
+            env.events().publish(
+                (EVENT_ISSUER_TRANSFER_ACCEPTED, offering_id.issuer.clone(), offering_id.namespace.clone(), offering_id.token.clone()),
+                (old_issuer, new_issuer.clone()),
+            );
+            return Ok(());
+        }
+
+        let new_offering_id = OfferingId {
+            issuer: new_issuer.clone(),
+            namespace: offering_id.namespace.clone(),
+            token: offering_id.token.clone(),
+        };
+
+        // Prevent duplicate offering entries for the same new issuer / namespace / token.
+        if Self::get_offering(env.clone(), new_issuer.clone(), offering_id.namespace.clone(), offering_id.token.clone()).is_some() {
+            return Err(RevoraError::LimitReached);
+        }
+
+        // Register namespace metadata for the new issuer.
+        Self::ensure_issuer_registered(&env, &new_issuer);
+        Self::ensure_namespace_registered(&env, &new_issuer, &offering_id.namespace);
+
+        // Copy the offering registration record to the new issuer's tenant list.
+        let tenant_id = TenantId { issuer: new_issuer.clone(), namespace: offering_id.namespace.clone() };
+        let count_key = DataKey::OfferCount(tenant_id.clone());
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let offering = Self::get_offering(env.clone(), old_issuer.clone(), offering_id.namespace.clone(), offering_id.token.clone())
+            .ok_or(RevoraError::OfferingNotFound)?;
+        let item_key = DataKey::OfferItem(tenant_id.clone(), count);
+        env.storage().persistent().set(&item_key, &offering);
+        env.storage().persistent().set(&count_key, &(count + 1));
+
+        // Update issuer lookups for the old and new offering IDs.
+        env.storage()
+            .persistent()
+            .set(&DataKey::OfferingIssuer(offering_id.clone()), &new_issuer.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::OfferingIssuer(new_offering_id.clone()), &new_issuer.clone());
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingIssuerTransfer(offering_id.clone()));
+
+        env.events().publish(
+            (EVENT_ISSUER_TRANSFER_ACCEPTED, offering_id.issuer.clone(), offering_id.namespace.clone(), offering_id.token.clone()),
+            (old_issuer, new_issuer.clone()),
+        );
+        Ok(())
+    }
+
+    pub fn cancel_issuer_transfer(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
+        issuer.require_auth();
+
+        let offering_id = OfferingId { issuer: issuer.clone(), namespace: namespace.clone(), token: token.clone() };
+        let current_issuer = Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+            .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::NotAuthorized);
+        }
+
+        let key = DataKey::PendingIssuerTransfer(offering_id.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(RevoraError::NoTransferPending);
+        }
+
+        let pending: PendingTransfer = env.storage().persistent().get(&key).unwrap();
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (EVENT_ISSUER_TRANSFER_CANCELLED, issuer.clone(), namespace.clone(), token.clone()),
+            (issuer, pending.new_issuer),
+        );
+        Ok(())
+    }
+
     /// Initialize admin and optional safety role for emergency pause (#7).
     /// `event_only` configures the contract to skip persistent business state (#72).
     /// Can only be called once; panics if already initialized.
