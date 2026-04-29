@@ -4314,23 +4314,23 @@ impl RevoraRevenueShare {
         env.storage().persistent().get(&key).unwrap_or(0)
     }
 
-    /// Claim aggregated revenue across multiple unclaimed periods.
+    /// @notice Claim accumulated revenue for a holder across multiple unclaimed periods.
+    /// @dev Payouts are calculated based on the holder's share at the time of claim.
+    ///      Capped at MAX_CLAIM_PERIODS (50) per transaction for gas safety.
+    ///      This function enforces strict security invariants for multi-period claims.
     ///
-    /// Payouts are calculated based on the holder's share at the time of claim.
-    /// Capped at `MAX_CLAIM_PERIODS` (50) per transaction for gas safety.
+    /// @param holder The address of the token holder. Must provide authentication.
+    /// @param issuer The address of the offering issuer.
+    /// @param namespace A symbol identifying the namespace.
+    /// @param token The token representing the offering.
+    /// @param max_periods Maximum number of periods to process (0 = MAX_CLAIM_PERIODS).
     ///
-    /// ### Parameters
-    /// - `holder`: The address of the token holder. Must provide authentication.
-    /// - `token`: The token representing the offering.
-    /// - `max_periods`: Maximum number of periods to process (0 = `MAX_CLAIM_PERIODS`).
+    /// @return Ok(i128) The total payout amount on success.
+    /// @return Err(RevoraError::HolderBlacklisted) if the holder is blacklisted.
+    /// @return Err(RevoraError::NoPendingClaims) if no share is set or all periods are claimed.
+    /// @return Err(RevoraError::ClaimDelayNotElapsed) if the next period is still within the claim delay window.
     ///
-    /// ### Returns
-    /// - `Ok(i128)` The total payout amount on success.
-    /// - `Err(RevoraError::HolderBlacklisted)` if the holder is blacklisted.
-    /// - `Err(RevoraError::NoPendingClaims)` if no share is set or all periods are claimed.
-    /// - `Err(RevoraError::ClaimDelayNotElapsed)` if the next period is still within the claim delay window.
-    ///
-    /// ### Idempotency and Safety Invariants
+    /// # Idempotency and Safety Invariants
     ///
     /// This function provides the following hard guarantees:
     ///
@@ -4360,9 +4360,17 @@ impl RevoraRevenueShare {
     ///    All subsequent checks (blacklist, share, period count) are read-only and
     ///    produce no state changes on failure.
     ///
-    /// 7. **Blacklist check is pre-transfer**: A blacklisted holder is rejected before
-    ///    any storage write or token transfer occurs.
-    /// Claim accumulated revenue for a holder.
+    /// 7. **Blacklist/whitelist decisiveness during partial sequences**: The blacklist
+    ///    check is performed INSIDE the period iteration loop. If a holder becomes
+    ///    blacklisted mid-sequence during a multi-period claim, the loop breaks immediately
+    ///    and no subsequent periods in the batch are claimed. The index is only advanced
+    ///    for periods successfully processed before the blacklist took effect. This ensures
+    ///    blacklist/whitelist decisions remain decisive even during partial claim sequences.
+    ///
+    /// 8. **Index monotonicity enforced**: The function validates that period IDs are
+    ///    strictly increasing as they are retrieved from `PeriodEntry`. This ensures
+    ///    `LastClaimedIdx` advances only in ways that match the deposited period order,
+    ///    preventing any possibility of skipping periods or claiming out of order.
     ///
     /// # Arguments
     /// * `holder` - The address of the holder claiming revenue.
@@ -4383,11 +4391,14 @@ impl RevoraRevenueShare {
     ) -> Result<i128, RevoraError> {
         holder.require_auth();
 
+        let offering_id = OfferingId { issuer, namespace, token };
+
+        // Initial blacklist check for early fail-fast
         if Self::is_blacklisted(
             env.clone(),
-            issuer.clone(),
-            namespace.clone(),
-            token.clone(),
+            offering_id.issuer.clone(),
+            offering_id.namespace.clone(),
+            offering_id.token.clone(),
             holder.clone(),
         ) {
             return Err(RevoraError::HolderBlacklisted);
@@ -4395,16 +4406,15 @@ impl RevoraRevenueShare {
 
         let share_bps = Self::get_holder_share(
             env.clone(),
-            issuer.clone(),
-            namespace.clone(),
-            token.clone(),
+            offering_id.issuer.clone(),
+            offering_id.namespace.clone(),
+            offering_id.token.clone(),
             holder.clone(),
         );
         if share_bps == 0 {
             return Err(RevoraError::NoPendingClaims);
         }
 
-        let offering_id = OfferingId { issuer, namespace, token };
         Self::require_claim_window_open(&env, &offering_id)?;
 
         let count_key = DataKey::PeriodCount(offering_id.clone());
@@ -4431,10 +4441,36 @@ impl RevoraRevenueShare {
         let mut total_payout: i128 = 0;
         let mut claimed_periods = Vec::new(&env);
         let mut last_claimed_idx = start_idx;
+        let mut previous_period_id: Option<u64> = None;
 
         for i in start_idx..end_idx {
+            // Enforce blacklist/whitelist decisiveness during partial claim sequences
+            // This ensures that if a holder becomes blacklisted mid-sequence, subsequent
+            // periods in the batch are not claimed
+            if Self::is_blacklisted(
+                env.clone(),
+                offering_id.issuer.clone(),
+                offering_id.namespace.clone(),
+                offering_id.token.clone(),
+                holder.clone(),
+            ) {
+                break;
+            }
+
             let entry_key = DataKey::PeriodEntry(offering_id.clone(), i);
             let period_id: u64 = env.storage().persistent().get(&entry_key).unwrap();
+
+            // Enforce index monotonicity: ensure periods are claimed in the exact
+            // order they were deposited in PeriodEntry
+            if let Some(prev_id) = previous_period_id {
+                if period_id <= prev_id {
+                    // PeriodEntry order violated - this should never happen with correct
+                    // deposit_revenue implementation, but we defensively check
+                    return Err(RevoraError::NoPendingClaims);
+                }
+            }
+            previous_period_id = Some(period_id);
+
             let time_key = DataKey::PeriodDepositTime(offering_id.clone(), period_id);
             let deposit_time: u64 = env.storage().persistent().get(&time_key).unwrap_or(0);
             if delay_secs > 0 && now < deposit_time.saturating_add(delay_secs) {

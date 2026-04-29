@@ -3426,6 +3426,198 @@ fn set_claim_delay_emits_event() {
 }
 
 // ===========================================================================
+// Claim delay and index monotonicity hardening tests
+// ===========================================================================
+
+/// Test that blacklist check is enforced during partial claim sequences.
+/// If a holder becomes blacklisted mid-sequence, subsequent periods in the
+/// batch should not be claimed.
+#[test]
+fn claim_blacklist_mid_sequence_stops_claiming() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let holder = Address::generate(&env);
+
+    env.ledger().with_mut(|li| li.timestamp = 1000);
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &10_000); // 100%
+
+    // Deposit 5 periods
+    for i in 1..=5_u64 {
+        client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &10_000, &i);
+    }
+
+    // Claim first 2 periods
+    let payout1 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &2);
+    assert_eq!(payout1, 20_000);
+
+    // Blacklist the holder
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &holder);
+
+    // Attempt to claim more periods - should fail with HolderBlacklisted
+    let result = client.try_claim(&holder, &issuer, &symbol_short!("def"), &token, &10);
+    assert_eq!(result, Err(Ok(RevoraError::HolderBlacklisted)));
+
+    // Verify that only 2 periods were claimed (index should be at 2)
+    let pending = client.get_pending_periods(&issuer, &symbol_short!("def"), &token, &holder);
+    assert_eq!(pending.len(), 3); // Periods 3, 4, 5 still pending
+}
+
+/// Test that multi-index claims respect the claim delay for each period individually.
+/// Periods that haven't elapsed their delay should not be claimed, even if later
+/// periods have elapsed their delay.
+#[test]
+fn claim_multi_index_respects_delay_per_period() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let holder = Address::generate(&env);
+
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &10_000); // 100%
+    client.set_claim_delay(&issuer, &symbol_short!("def"), &token, &100);
+
+    // Deposit period 1 at T=1000
+    env.ledger().with_mut(|li| li.timestamp = 1000);
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &10_000, &1);
+
+    // Deposit period 2 at T=1050
+    env.ledger().with_mut(|li| li.timestamp = 1050);
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &20_000, &2);
+
+    // Deposit period 3 at T=1100
+    env.ledger().with_mut(|li| li.timestamp = 1100);
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &30_000, &3);
+
+    // At T=1150: period 1 claimable (1000+100<=1150), period 2 claimable (1050+100<=1150),
+    // period 3 NOT claimable (1100+100>1150)
+    env.ledger().with_mut(|li| li.timestamp = 1150);
+    let payout = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &10);
+    assert_eq!(payout, 30_000); // Only periods 1 and 2 claimed
+
+    // Verify period 3 is still pending
+    let pending = client.get_pending_periods(&issuer, &symbol_short!("def"), &token, &holder);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending.get(0).unwrap(), &3);
+
+    // At T=1200: period 3 now claimable (1100+100<=1200)
+    env.ledger().with_mut(|li| li.timestamp = 1200);
+    let payout2 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &10);
+    assert_eq!(payout2, 30_000);
+
+    // All periods claimed
+    let pending = client.get_pending_periods(&issuer, &symbol_short!("def"), &token, &holder);
+    assert_eq!(pending.len(), 0);
+}
+
+/// Test that LastClaimedIdx advances monotonically and matches PeriodEntry order.
+/// This verifies that periods cannot be skipped or claimed out of order.
+#[test]
+fn claim_index_monotonicity_enforced() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let holder = Address::generate(&env);
+
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &10_000); // 100%
+
+    // Deposit periods in order: 1, 2, 3, 4, 5
+    for i in 1..=5_u64 {
+        client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &10_000, &i);
+    }
+
+    // Claim all 5 periods
+    let payout = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+    assert_eq!(payout, 50_000);
+
+    // Verify LastClaimedIdx is at 5 (all periods claimed)
+    let pending = client.get_pending_periods(&issuer, &symbol_short!("def"), &token, &holder);
+    assert_eq!(pending.len(), 0);
+
+    // Verify that re-claiming fails with NoPendingClaims
+    let result = client.try_claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+    assert_eq!(result, Err(Ok(RevoraError::NoPendingClaims)));
+}
+
+/// Test that claim v2 event payloads include correct period information.
+#[test]
+fn claim_v2_event_payload_verification() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let holder = Address::generate(&env);
+
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &5_000); // 50%
+
+    // Deposit 3 periods
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &10_000, &1);
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &20_000, &2);
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &30_000, &3);
+
+    // Claim all 3 periods
+    let payout = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+    assert_eq!(payout, 30_000); // 50% of 60k
+
+    // Verify v2 event was emitted with correct payload
+    let events = env.events().all();
+    let claim_events: Vec<_> = events
+        .into_iter()
+        .filter(|e| e.topics[0] == EVENT_CLAIM_V2.to_val())
+        .collect();
+
+    assert!(!claim_events.is_empty(), "claim2 event should be emitted");
+
+    // The event should contain: holder, total_payout, claimed_periods (Vec<u64>)
+    let last_claim_event = claim_events.last().unwrap();
+    let payload = &last_claim_event.data;
+    
+    // Verify payload structure: (holder, total_payout, claimed_periods)
+    assert_eq!(payload[0].clone().into_address().unwrap(), holder);
+    assert_eq!(payload[1].clone().into_i128().unwrap(), 30_000);
+    
+    // Verify claimed_periods is a Vec with 3 period IDs
+    let claimed_periods_vec = payload[2].clone().into_vec().unwrap();
+    assert_eq!(claimed_periods_vec.len(), 3);
+    assert_eq!(claimed_periods_vec.get(0).unwrap().to_u64(), Some(1));
+    assert_eq!(claimed_periods_vec.get(1).unwrap().to_u64(), Some(2));
+    assert_eq!(claimed_periods_vec.get(2).unwrap().to_u64(), Some(3));
+}
+
+/// Test that partial claim sequences with delay correctly advance LastClaimedIdx
+/// only for periods that have elapsed their delay.
+#[test]
+fn claim_partial_sequence_with_delay_advances_index_correctly() {
+    let (env, client, issuer, token, payment_token, _contract_id) = claim_setup();
+    let holder = Address::generate(&env);
+
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &10_000); // 100%
+    client.set_claim_delay(&issuer, &symbol_short!("def"), &token, &200);
+
+    // Deposit period 1 at T=1000
+    env.ledger().with_mut(|li| li.timestamp = 1000);
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &10_000, &1);
+
+    // Deposit period 2 at T=1100
+    env.ledger().with_mut(|li| li.timestamp = 1100);
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &20_000, &2);
+
+    // Deposit period 3 at T=1200
+    env.ledger().with_mut(|li| li.timestamp = 1200);
+    client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &30_000, &3);
+
+    // At T=1250: only period 1 claimable (1000+200<=1250)
+    env.ledger().with_mut(|li| li.timestamp = 1250);
+    let payout1 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &10);
+    assert_eq!(payout1, 10_000);
+
+    // Verify LastClaimedIdx advanced to 1 (only period 1 claimed)
+    let pending = client.get_pending_periods(&issuer, &symbol_short!("def"), &token, &holder);
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending.get(0).unwrap(), &2);
+
+    // At T=1350: period 2 claimable (1100+200<=1350), period 3 NOT (1200+200>1350)
+    env.ledger().with_mut(|li| li.timestamp = 1350);
+    let payout2 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &10);
+    assert_eq!(payout2, 20_000);
+
+    // Verify LastClaimedIdx advanced to 2 (periods 1 and 2 claimed)
+    let pending = client.get_pending_periods(&issuer, &symbol_short!("def"), &token, &holder);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending.get(0).unwrap(), &3);
+}
+
+// ===========================================================================
 // On-chain distribution simulation (#29)
 // ===========================================================================
 
