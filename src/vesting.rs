@@ -46,10 +46,32 @@ pub enum VestingDataKey {
     ClaimRecord(Address, u32, u32),
 }
 
+// Legacy event symbols (for backward compatibility)
 const EVENT_VESTING_CREATED: Symbol = symbol_short!("vest_crt");
 const EVENT_VESTING_CLAIMED: Symbol = symbol_short!("vest_clm");
 const EVENT_VESTING_CANCELLED: Symbol = symbol_short!("vest_can");
 const EVENT_VESTING_AMENDED: Symbol = symbol_short!("vest_amd");
+const EVENT_VESTING_PCLAIM: Symbol = symbol_short!("vest_pcl");
+
+/// Shared schema version for vesting events.
+pub const VESTING_EVENT_SCHEMA_VERSION: u32 = 1;
+
+const EVENT_VESTING_CREATED_V1: Symbol = symbol_short!("vst_crt1");
+const EVENT_VESTING_CLAIMED_V1: Symbol = symbol_short!("vst_clm1");
+const EVENT_VESTING_CANCELLED_V1: Symbol = symbol_short!("vst_can1");
+const EVENT_VESTING_PCLAIM_V1: Symbol = symbol_short!("vst_pcl1");
+
+// Versioned event symbols (v1 schema)
+const EVENT_VESTING_CREATED_V1: Symbol = symbol_short!("vst_crt1");
+const EVENT_VESTING_CLAIMED_V1: Symbol = symbol_short!("vst_clm1");
+const EVENT_VESTING_CANCELLED_V1: Symbol = symbol_short!("vst_can1");
+const EVENT_VESTING_AMENDED_V1: Symbol = symbol_short!("vst_amd1");
+
+// Partial claim event
+const EVENT_VESTING_PCLAIM: Symbol = symbol_short!("vest_pcl");
+
+// Event schema version
+pub const VESTING_EVENT_SCHEMA_VERSION: u32 = 1;
 
 #[contract]
 pub struct RevoraVesting;
@@ -248,8 +270,12 @@ impl RevoraVesting {
         env.storage().persistent().set(&key, &schedule);
 
         env.events().publish(
-            (EVENT_VESTING_AMENDED, admin, beneficiary),
+            (EVENT_VESTING_AMENDED, admin.clone(), beneficiary.clone()),
             (schedule_index, new_total_amount, new_start_time, new_cliff_time, new_end_time),
+        );
+        env.events().publish(
+            (EVENT_VESTING_AMENDED_V1, admin, beneficiary),
+            (VESTING_EVENT_SCHEMA_VERSION, schedule_index, new_total_amount, new_start_time, new_cliff_time, new_end_time),
         );
 
         Ok(())
@@ -274,6 +300,10 @@ impl RevoraVesting {
     }
 
     /// Claim vested tokens. Callable by beneficiary.
+    ///
+    /// Claim accounting is checked before storage is updated so the claimed
+    /// balance can never exceed the schedule total, even if a partial claim
+    /// arrives after other state changes.
     /// Renamed to `claim_vesting` to avoid symbol conflicts with other contracts.
     pub fn claim_vesting(
         env: Env,
@@ -296,7 +326,12 @@ impl RevoraVesting {
         if claimable <= 0 {
             return Err(VestingError::NothingToClaim);
         }
-        schedule.claimed_amount = schedule.claimed_amount.saturating_add(claimable);
+        let new_claimed =
+            schedule.claimed_amount.checked_add(claimable).ok_or(VestingError::InvalidAmount)?;
+        if new_claimed > schedule.total_amount {
+            return Err(VestingError::InvalidAmount);
+        }
+        schedule.claimed_amount = new_claimed;
         env.storage().persistent().set(&key, &schedule);
 
         let contract_addr = env.current_contract_address();
@@ -318,7 +353,10 @@ impl RevoraVesting {
     }
 
     /// Claim a specific amount of currently claimable tokens (partial claim).
-    /// Emits a dedicated partial-claim event and records the claim in history.
+    ///
+    /// Partial claims are append-only. Each success writes one ledger record,
+    /// advances the schedule cursor, and emits both legacy and versioned
+    /// partial-claim events.
     pub fn claim_vesting_partial(
         env: Env,
         beneficiary: Address,
@@ -348,13 +386,21 @@ impl RevoraVesting {
             return Err(VestingError::InvalidAmount);
         }
 
-        // Update claimed and persist
-        schedule.claimed_amount = schedule.claimed_amount.saturating_add(amount);
+        let new_claimed =
+            schedule.claimed_amount.checked_add(amount).ok_or(VestingError::InvalidAmount)?;
+        if new_claimed > schedule.total_amount {
+            return Err(VestingError::InvalidAmount);
+        }
+
+        // Update claimed amount first so the schedule stays internally consistent
+        // if later checks or transfers fail and the transaction rolls back.
+        schedule.claimed_amount = new_claimed;
         env.storage().persistent().set(&key, &schedule);
 
         // Transfer tokens from this contract to beneficiary
         let contract_addr = env.current_contract_address();
         token::Client::new(&env, &schedule.token).transfer(&contract_addr, &beneficiary, &amount);
+        let token = schedule.token.clone();
 
         // Record claim history: append (timestamp, amount)
         let cnt_key = VestingDataKey::ClaimCount(admin.clone(), schedule_index);
@@ -364,15 +410,22 @@ impl RevoraVesting {
         env.storage().persistent().set(&rec_key, &record);
         env.storage().persistent().set(&cnt_key, &(count + 1));
 
-        // Emit event for partial claim
+        // Emit events for partial claim.
         env.events().publish(
             (EVENT_VESTING_PCLAIM, beneficiary.clone(), admin),
-            (schedule_index, schedule.token, amount, count),
+            (schedule_index, token.clone(), amount, count),
+        );
+        env.events().publish(
+            (EVENT_VESTING_PCLAIM_V1, beneficiary, admin),
+            (VESTING_EVENT_SCHEMA_VERSION, schedule_index, token, amount, count),
         );
         Ok(amount)
     }
 
-    /// Return number of partial-claim records for a schedule.
+    /// Return the append-only cursor for partial-claim records.
+    ///
+    /// The value is also the current record count. The next successful
+    /// partial claim is written at this index.
     pub fn get_partial_claim_count(env: Env, admin: Address, schedule_index: u32) -> u32 {
         env.storage()
             .persistent()
@@ -380,7 +433,7 @@ impl RevoraVesting {
             .unwrap_or(0)
     }
 
-    /// Return a partial-claim record (timestamp, amount) by index.
+    /// Return a partial-claim ledger record `(timestamp, amount)` by cursor index.
     pub fn get_partial_claim_record(
         env: Env,
         admin: Address,

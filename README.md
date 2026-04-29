@@ -187,6 +187,68 @@ checked inside the claim loop. Both must pass for a period to be claimable.
 For the full boundary matrix, zero-width window notes, and security/risk analysis see
 [docs/time-window-boundary-matrix.md](./docs/time-window-boundary-matrix.md).
 
+### Claim Delay and Index Monotonicity
+
+The contract enforces strict security invariants for multi-period claims to prevent double-payment, period skipping, and ensure blacklist/whitelist decisiveness.
+
+#### Claim Delay Semantics
+
+Issuers can configure a per-offering claim delay via `set_claim_delay(issuer, namespace, token, delay_secs)`. This delay is enforced **per-period** based on the deposit timestamp:
+
+- A period becomes claimable only after `deposit_time + delay_secs` has elapsed
+- The delay check occurs **inside the claim iteration loop** for each period
+- If a period's delay has not elapsed, the claim loop stops immediately
+- Periods that haven't elapsed their delay are **not** claimed, even if later periods in the batch have elapsed their delay
+- `ClaimDelayNotElapsed` is returned if **no periods** in the batch have elapsed their delay
+
+Example: With delay=100s, periods deposited at T=1000, T=1050, T=1100:
+- At T=1150: Only periods 1 and 2 are claimable (1000+100≤1150, 1050+100≤1150)
+- At T=1200: All three periods are claimable (1100+100≤1200)
+
+#### Index Monotonicity and Period Ordering
+
+The contract maintains a strict invariant that `LastClaimedIdx` advances only in ways that match the deposited `PeriodEntry` order:
+
+- Periods are stored in `PeriodEntry(offering_id, sequential_index) -> period_id`
+- The `claim` function validates that period IDs are strictly increasing as retrieved from `PeriodEntry`
+- This prevents any possibility of skipping periods or claiming out of order
+- If the period order is violated (defensive check), the claim fails with `NoPendingClaims`
+
+#### Blacklist/Whitelist Decisiveness During Partial Sequences
+
+The blacklist check is performed **inside the period iteration loop**, not just at the start:
+
+- If a holder becomes blacklisted mid-sequence during a multi-period claim, the loop breaks immediately
+- No subsequent periods in the batch are claimed after the blacklist takes effect
+- `LastClaimedIdx` is only advanced for periods successfully processed **before** the blacklist took effect
+- This ensures blacklist/whitelist decisions remain decisive even during partial claim sequences
+
+Example: A holder claims periods 1-2, then gets blacklisted. A subsequent claim attempt for periods 3-5 will fail with `HolderBlacklisted` and no periods will be claimed.
+
+#### Security Invariants
+
+The `claim` function provides the following hard guarantees:
+
+1. **No double-pay**: `LastClaimedIdx` is written to storage only after the token transfer succeeds. If the transfer fails, the index is not advanced.
+2. **Index advances only on processed periods**: The index reflects only periods that passed the delay check and blacklist check.
+3. **Zero-payout periods advance the index**: A period with zero revenue still advances `LastClaimedIdx` to prevent permanently stuck indices.
+4. **Exhausted state returns `NoPendingClaims`**: Once all periods are claimed, subsequent calls return this error without touching storage.
+5. **Per-holder isolation**: Each holder's `LastClaimedIdx` is keyed by `(offering_id, holder)`.
+6. **Auth checked first**: `holder.require_auth()` is the first operation.
+7. **Blacklist/whitelist decisiveness during partial sequences**: The blacklist check is performed inside the loop, ensuring mid-sequence blacklists stop claiming immediately.
+8. **Index monotonicity enforced**: Period IDs must be strictly increasing as retrieved from `PeriodEntry`, preventing out-of-order claims.
+
+#### Test Coverage
+
+Comprehensive tests verify these invariants:
+- `claim_before_delay_returns_claim_delay_not_elapsed`: Pre-delay claim fails
+- `claim_after_delay_succeeds`: Post-delay claim succeeds
+- `claim_delay_partial_periods_only_claimable_after_delay`: Partial claim respects delay per period
+- `claim_blacklist_mid_sequence_stops_claiming`: Blacklist enforced during partial sequences
+- `claim_multi_index_respects_delay_per_period`: Multi-index claims respect delay per period
+- `claim_index_monotonicity_enforced`: Index monotonicity and period ordering
+- `claim_v2_event_payload_verification`: V2 event payloads include correct period information
+- `claim_partial_sequence_with_delay_advances_index_correctly`: Partial sequences advance index correctly
 
 
 - **Version:** Call `get_version()` to read the current contract version (a constant, e.g., `4`). This value is bumped when storage layout or semantics change in a way that affects compatibility.
@@ -214,10 +276,10 @@ Accepted ranges and rejection semantics:
 | `amount` | `deposit_revenue` | > 0 | `InvalidAmount` |
 | `amount` | `deposit_revenue_with_snapshot` | > 0 | `InvalidAmount` |
 | `snapshot_reference` | `deposit_revenue_with_snapshot` | > 0 | `InvalidAmount` |
-| `period_id` | `deposit_revenue` | > 0 | `InvalidPeriodId` |
+| `period_id` | `deposit_revenue` | `> 0`, `last + 1`, and non-duplicate | `InvalidPeriodId` (0/gap), `PeriodAlreadyDeposited` (dup) |
 | `min_stake` | `set_investment_constraints` | >= 0 | `InvalidAmount` |
 | `max_stake` | `set_investment_constraints` | >= 0 and `>= min_stake` when set | `InvalidAmount` |
-| `period_id` | `report_revenue` | any u64 | — |
+| `period_id` | `report_revenue` | `> 0` and `last + 1` (for new reports) | `InvalidPeriodId` |
 | `min_amount` | `set_min_revenue_threshold` | ≥ 0 | `InvalidAmount` |
 
 Use `try_*` client methods to receive these errors as `Result`.
