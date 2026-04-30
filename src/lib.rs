@@ -1180,8 +1180,11 @@ impl RevoraRevenueShare {
         env.storage()
             .persistent()
             .set(&DataKey::HolderShare(offering_id, holder.clone()), &share_bps);
+        env.events()
+            .publish((EVENT_SHARE_SET, issuer.clone(), namespace.clone(), token.clone()), (holder.clone(), share_bps));
+        // Versioned v2 event: [2, holder, share_bps] — always emitted (#RC26Q2-C31)
         Self::emit_v2_event(
-            &env,
+            env,
             (EVENT_SHARE_SET_V2, issuer, namespace, token),
             (holder, share_bps),
         );
@@ -2001,6 +2004,12 @@ impl RevoraRevenueShare {
                 (EVENT_SCHEMA_VERSION, token.clone(), revenue_share_bps, payout_asset.clone()),
             );
         }
+        // Versioned v2 event: [2, token, revenue_share_bps, payout_asset] — always emitted (#RC26Q2-C31)
+        Self::emit_v2_event(
+            &env,
+            (EVENT_OFFER_REG_V2, issuer, namespace, token.clone()),
+            (token, revenue_share_bps, payout_asset),
+        );
 
         Ok(())
     }
@@ -2366,6 +2375,13 @@ impl RevoraRevenueShare {
                         ),
                         (amount, payout_asset.clone()),
                     );
+                    // Versioned v2 event: [2, amount, period_id, blacklist] — always emitted (#RC26Q2-C31)
+                    Self::emit_v2_event(
+                        env,
+                        (EVENT_REV_INIT_V2, issuer.clone(), namespace.clone(), token.clone()),
+                        (amount, period_id, blacklist.clone()),
+                    );
+
                     env.events().publish(
                         (
                             EVENT_REVENUE_REPORT_INITIAL_ASSET,
@@ -2402,41 +2418,27 @@ impl RevoraRevenueShare {
             (EVENT_REVENUE_REPORTED_ASSET, issuer.clone(), namespace.clone(), token.clone()),
             (payout_asset.clone(), amount, period_id),
         );
+        // Versioned v2 events: always emitted regardless of feature flags (#RC26Q2-C31)
+        // rv_rep2: [2, amount, period_id, blacklist]
+        Self::emit_v2_event(
+            &env,
+            (EVENT_REV_REP_V2, issuer.clone(), namespace.clone(), token.clone()),
+            (amount, period_id, blacklist.clone()),
+        );
+        // rv_repa2: [2, payout_asset, amount, period_id]
+        Self::emit_v2_event(
+            &env,
+            (EVENT_REV_REPA_V2, issuer.clone(), namespace.clone(), token.clone()),
+            (payout_asset.clone(), amount, period_id),
+        );
+        // rv_inia2: [2, payout_asset, amount, period_id, blacklist]
+        Self::emit_v2_event(
+            &env,
+            (EVENT_REV_INIA_V2, issuer.clone(), namespace.clone(), token.clone()),
+            (payout_asset.clone(), amount, period_id, blacklist.clone()),
+        );
 
         if Self::is_event_versioning_enabled(env.clone()) {
-            if actual_initial {
-                Self::emit_v2_event(
-                    &env,
-                    (EVENT_REV_INIT_V2, issuer.clone(), namespace.clone(), token.clone()),
-                    (amount, period_id, blacklist.clone()),
-                );
-                Self::emit_v2_event(
-                    &env,
-                    (EVENT_REV_INIA_V2, issuer.clone(), namespace.clone(), token.clone()),
-                    (payout_asset.clone(), amount, period_id, blacklist.clone()),
-                );
-                env.events().publish(
-                    (EVENT_REV_INIT_V1, issuer.clone(), namespace.clone(), token.clone()),
-                    (EVENT_SCHEMA_VERSION, amount, period_id, blacklist.clone()),
-                );
-                env.events().publish(
-                    (EVENT_REV_INIA_V1, issuer.clone(), namespace.clone(), token.clone()),
-                    (
-                        EVENT_SCHEMA_VERSION,
-                        payout_asset.clone(),
-                        amount,
-                        period_id,
-                        blacklist.clone(),
-                    ),
-                );
-            }
-
-            Self::emit_v2_event(
-                &env,
-                (EVENT_REV_REP_V2, issuer.clone(), namespace.clone(), token.clone()),
-                (amount, period_id, blacklist.clone()),
-            );
-        }
 
         if Self::is_event_versioning_enabled(env.clone()) {
             env.events().publish(
@@ -4531,8 +4533,18 @@ impl RevoraRevenueShare {
         // Advance claim index only for periods actually claimed (respecting delay)
         env.storage().persistent().set(&idx_key, &last_claimed_idx);
 
+        // Versioned v2 event: [2, holder, total_payout, periods] — always emitted (#RC26Q2-C31)
         Self::emit_v2_event(
             &env,
+            (
+                EVENT_CLAIM_V2,
+                offering_id.issuer.clone(),
+                offering_id.namespace.clone(),
+                offering_id.token.clone(),
+            ),
+            (holder.clone(), total_payout, claimed_periods.clone()),
+        );
+        env.events().publish(
             (
                 EVENT_CLAIM_V2,
                 offering_id.issuer.clone(),
