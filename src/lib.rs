@@ -5629,3 +5629,7 @@ impl RevoraRevenueShare {
         Ok(())
     }
 } // end impl RevoraRevenueShare (plain)
+
+// Include structured error discriminant stability tests
+#[cfg(test)]
+mod structured_error_tests;
