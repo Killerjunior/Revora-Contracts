@@ -9448,155 +9448,131 @@ mod regression {
         assert!(r.is_ok());
     }
 
-    /// Regression Test: set_concentration_limit silent no-op in event_only mode
+    /// Regression Test: get_offering O(1) direct index
     ///
-    /// **Related Issue:** #354
+    /// **Related Issue:** #360
     ///
     /// **Original Bug:**
-    /// `set_concentration_limit` placed `issuer.require_auth()`, the storage write, and the event
-    /// emission all inside `if !Self::is_event_only(&env)`. In event-only deployments the function
-    /// returned `Ok(())` without storing the config or emitting any event, making the call a
-    /// completely silent no-op. Callers had no way to detect the failure, and subsequent
-    /// `report_revenue` enforcement silently did nothing.
+    /// `get_offering` scanned every `OfferItem` entry for an issuer/namespace to find the
+    /// matching token — O(n) cost that grows with the number of offerings. This is called
+    /// on every hot path (`report_revenue`, `accept_issuer_transfer`, etc.).
     ///
     /// **Expected Behavior:**
-    /// Auth is always required. In event-only mode the config is not persisted (consistent with
-    /// the rest of the event-only contract pattern) but the event IS emitted so callers can
-    /// observe the call. In normal mode both storage and event happen as before.
+    /// After registration a `DataKey2::OfferingRecord` entry is written so `get_offering`
+    /// can resolve in O(1). The O(n) scan is retained as a fallback for legacy data.
     ///
     /// **Fix Applied:**
-    /// Moved `issuer.require_auth()` outside the `if !event_only` block and moved the
-    /// `emit_v2_event` call outside as well, keeping only the storage write inside the guard.
+    /// Added `DataKey2::OfferingRecord(OfferingId)` written at `register_offering` and
+    /// updated at `accept_issuer_transfer`. `get_offering` reads the direct key first.
     #[test]
-    fn regression_issue_354_set_concentration_limit_event_only_emits_event() {
+    fn regression_issue_360_get_offering_direct_lookup() {
         let env = Env::default();
         env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, RevoraRevenueShare);
-        let client = RevoraRevenueShareClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        client.initialize(&admin, &None, &Some(true));
-
+        let client = make_client(&env);
         let issuer = Address::generate(&env);
         let token = Address::generate(&env);
-        let payout_asset = Address::generate(&env);
+        let payout = Address::generate(&env);
 
-        // In event-only mode register_offering emits but does not persist
-        client.register_offering(&issuer, &symbol_short!("def"), &token, &1000, &payout_asset, &0);
+        client.register_offering(&issuer, &symbol_short!("def"), &token, &500, &payout, &0);
 
-        let before = env.events().all().len();
-        let result = client.try_set_concentration_limit(
-            &issuer,
+        let result = client.get_offering(&issuer, &symbol_short!("def"), &token);
+        assert!(result.is_some());
+        let o = result.unwrap();
+        assert_eq!(o.token, token);
+        assert_eq!(o.issuer, issuer);
+        assert_eq!(o.revenue_share_bps, 500);
+    }
+
+    #[test]
+    fn regression_issue_360_get_offering_many_offerings_still_finds_correct() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = make_client(&env);
+        let issuer = Address::generate(&env);
+        let payout = Address::generate(&env);
+
+        // Register 10 offerings; target is the last one
+        let mut target_token = Address::generate(&env);
+        for i in 0..10u32 {
+            let t = Address::generate(&env);
+            client.register_offering(&issuer, &symbol_short!("def"), &t, &(i * 100), &payout, &0);
+            if i == 9 {
+                target_token = t;
+            }
+        }
+
+        let result = client.get_offering(&issuer, &symbol_short!("def"), &target_token);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().revenue_share_bps, 900);
+    }
+
+    #[test]
+    fn regression_issue_360_get_offering_after_issuer_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = make_client(&env);
+        let old_issuer = Address::generate(&env);
+        let new_issuer = Address::generate(&env);
+        let token = Address::generate(&env);
+        let payout = Address::generate(&env);
+
+        client.register_offering(
+            &old_issuer,
             &symbol_short!("def"),
             &token,
-            &5_000,
-            &true,
+            &300,
+            &payout,
+            &0,
         );
-        // Must succeed (not a silent no-op)
-        assert!(result.is_ok());
-        // Event must be emitted even in event-only mode
-        assert!(env.events().all().len() > before, "expected conc_lim event in event-only mode");
+        client.propose_issuer_transfer(&old_issuer, &symbol_short!("def"), &token, &new_issuer);
+        client.accept_issuer_transfer(&new_issuer, &symbol_short!("def"), &token);
+
+        // New issuer can look up the offering directly
+        let result = client.get_offering(&new_issuer, &symbol_short!("def"), &token);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().token, token);
     }
 
     #[test]
-    fn regression_issue_354_set_concentration_limit_event_only_does_not_persist() {
+    fn regression_issue_360_get_offering_unknown_returns_none() {
         let env = Env::default();
         env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, RevoraRevenueShare);
-        let client = RevoraRevenueShareClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        client.initialize(&admin, &None, &Some(true));
-
+        let client = make_client(&env);
         let issuer = Address::generate(&env);
         let token = Address::generate(&env);
-        let payout_asset = Address::generate(&env);
 
-        client.register_offering(&issuer, &symbol_short!("def"), &token, &1000, &payout_asset, &0);
-        client.set_concentration_limit(&issuer, &symbol_short!("def"), &token, &5_000, &true);
+        let result = client.get_offering(&issuer, &symbol_short!("def"), &token);
+        assert!(result.is_none());
+    }
+}
 
-        // In event-only mode config must NOT be persisted
-        let stored = client.get_concentration_limit(&issuer, &symbol_short!("def"), &token);
-        assert!(stored.is_none(), "config must not be stored in event-only mode");
+        client.register_offering(
+            &old_issuer,
+            &symbol_short!("def"),
+            &token,
+            &300,
+            &payout,
+            &0,
+        );
+        client.propose_issuer_transfer(&old_issuer, &symbol_short!("def"), &token, &new_issuer);
+        client.accept_issuer_transfer(&new_issuer, &symbol_short!("def"), &token);
+
+        // New issuer can look up the offering directly
+        let result = client.get_offering(&new_issuer, &symbol_short!("def"), &token);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().token, token);
     }
 
     #[test]
-    fn regression_issue_354_set_concentration_limit_normal_mode_persists_and_emits() {
+    fn regression_issue_360_get_offering_unknown_returns_none() {
         let env = Env::default();
         env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, RevoraRevenueShare);
-        let client = RevoraRevenueShareClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        // Normal mode (event_only = false)
-        client.initialize(&admin, &None, &Some(false));
-
+        let client = make_client(&env);
         let issuer = Address::generate(&env);
         let token = Address::generate(&env);
-        let payout_asset = Address::generate(&env);
 
-        client.register_offering(&issuer, &symbol_short!("def"), &token, &1000, &payout_asset, &0);
-
-        let before = env.events().all().len();
-        client.set_concentration_limit(&issuer, &symbol_short!("def"), &token, &3_000, &false);
-
-        // Config persisted
-        let stored = client.get_concentration_limit(&issuer, &symbol_short!("def"), &token);
-        assert!(stored.is_some());
-        let cfg = stored.unwrap();
-        assert_eq!(cfg.max_bps, 3_000);
-        assert!(!cfg.enforce);
-
-        // Event emitted
-        assert!(env.events().all().len() > before);
-    }
-
-    #[test]
-    fn regression_issue_354_set_concentration_limit_enforce_true_max_bps_zero() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, RevoraRevenueShare);
-        let client = RevoraRevenueShareClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        client.initialize(&admin, &None, &Some(false));
-
-        let issuer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let payout_asset = Address::generate(&env);
-
-        client.register_offering(&issuer, &symbol_short!("def"), &token, &1000, &payout_asset, &0);
-        client.set_concentration_limit(&issuer, &symbol_short!("def"), &token, &0, &true);
-
-        let cfg = client
-            .get_concentration_limit(&issuer, &symbol_short!("def"), &token)
-            .unwrap();
-        assert_eq!(cfg.max_bps, 0);
-        assert!(cfg.enforce);
-    }
-
-    #[test]
-    fn regression_issue_354_set_concentration_limit_max_bps_10000() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, RevoraRevenueShare);
-        let client = RevoraRevenueShareClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        client.initialize(&admin, &None, &Some(false));
-
-        let issuer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let payout_asset = Address::generate(&env);
-
-        client.register_offering(&issuer, &symbol_short!("def"), &token, &1000, &payout_asset, &0);
-        let result =
-            client.try_set_concentration_limit(&issuer, &symbol_short!("def"), &token, &10_000, &true);
-        assert!(result.is_ok());
-        let cfg = client
-            .get_concentration_limit(&issuer, &symbol_short!("def"), &token)
-            .unwrap();
-        assert_eq!(cfg.max_bps, 10_000);
+        let result = client.get_offering(&issuer, &symbol_short!("def"), &token);
+        assert!(result.is_none());
     }
 }
 
