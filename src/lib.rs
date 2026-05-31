@@ -251,6 +251,7 @@ const EVENT_UNPAUSED: Symbol = symbol_short!("unpaused");
 const EVENT_ISSUER_TRANSFER_PROPOSED: Symbol = symbol_short!("iss_prop");
 const EVENT_ISSUER_TRANSFER_ACCEPTED: Symbol = symbol_short!("iss_acc");
 const EVENT_ISSUER_TRANSFER_CANCELLED: Symbol = symbol_short!("iss_canc");
+const EVENT_ISSUER_TRANSFER_REJECTED: Symbol = symbol_short!("iss_rej");
 const EVENT_TESTNET_MODE: Symbol = symbol_short!("test_mode");
 
 const EVENT_DIST_CALC: Symbol = symbol_short!("dist_calc");
@@ -1831,6 +1832,42 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
+    pub fn reject_issuer_transfer(
+        env: Env,
+        new_issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
+        new_issuer.require_auth();
+
+        let offering_id =
+            Self::find_pending_transfer_for_new_issuer(&env, &namespace, &token, &new_issuer)
+                .ok_or(RevoraError::NoTransferPending)?;
+
+        let _pending: PendingTransfer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingIssuerTransfer(offering_id.clone()))
+            .ok_or(RevoraError::NoTransferPending)?;
+
+        let old_issuer = offering_id.issuer.clone();
+
+        env.storage().persistent().remove(&DataKey::PendingIssuerTransfer(offering_id.clone()));
+
+        env.events().publish(
+            (
+                EVENT_ISSUER_TRANSFER_REJECTED,
+                offering_id.issuer.clone(),
+                offering_id.namespace.clone(),
+                offering_id.token.clone(),
+            ),
+            (old_issuer, new_issuer.clone()),
+        );
+        Ok(())
+    }
+
     /// Initialize admin and optional safety role for emergency pause (#7).
     /// `event_only` configures the contract to skip persistent business state (#72).
     /// Can only be called once; panics if already initialized.
@@ -3266,8 +3303,8 @@ impl RevoraRevenueShare {
     /// ### Returns
     /// The maximum allowed blacklist size for the offering.
     fn get_effective_blacklist_limit(env: &Env, offering_id: &OfferingId) -> u32 {
-        let key = DataKey2::BlacklistSizeLimit(offering_id.clone());
-        env.storage().persistent().get::<DataKey2, u32>(&key).unwrap_or(MAX_BLACKLIST_SIZE)
+        let key = DataKey::BlacklistSizeLimit(offering_id.clone());
+        env.storage().persistent().get::<DataKey, u32>(&key).unwrap_or(MAX_BLACKLIST_SIZE)
     }
 
     /// Set the per-offering blacklist size limit.
