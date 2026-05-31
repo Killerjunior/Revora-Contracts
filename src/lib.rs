@@ -164,11 +164,32 @@ pub enum RevoraError {
 pub mod vesting;
 
 #[cfg(test)]
+mod test_claim_transfer_fail;
+#[cfg(test)]
 mod test_duplicates;
 #[cfg(test)]
 mod test_min_revenue_threshold_boundary;
 #[cfg(test)]
-mod test_claim_transfer_fail;
+mod test_multisig_gas;
+#[cfg(test)]
+mod test_pause_tiers;
+
+/// Two-tier pause state stored at `DataKey::Paused`.
+///
+/// - `NotPaused`  – normal operation; all entrypoints are open.
+/// - `SoftPaused` – blocks reports and deposits but **allows** `claim`, so
+///                  holders can still withdraw their funds during incident response.
+/// - `HardPaused` – blocks every state-mutating operation including `claim`.
+///
+/// Wire values are stable: do not renumber.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PauseState {
+    NotPaused = 0,
+    SoftPaused = 1,
+    HardPaused = 2,
+}
 
 // â”€â”€ Event symbols â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const EVENT_REVENUE_REPORTED: Symbol = symbol_short!("rev_rep");
@@ -249,6 +270,8 @@ const EVENT_SNAP_CONFIG: Symbol = symbol_short!("snap_cfg");
 const EVENT_INIT: Symbol = symbol_short!("init");
 const EVENT_PAUSED: Symbol = symbol_short!("paused");
 const EVENT_UNPAUSED: Symbol = symbol_short!("unpaused");
+/// Versioned pause event carrying the tier (SoftPaused / HardPaused / NotPaused).
+const EVENT_PAUSED2: Symbol = symbol_short!("paused2");
 
 const EVENT_ISSUER_TRANSFER_PROPOSED: Symbol = symbol_short!("iss_prop");
 const EVENT_ISSUER_TRANSFER_ACCEPTED: Symbol = symbol_short!("iss_acc");
@@ -1934,15 +1957,16 @@ impl RevoraRevenueShare {
         if let Some(ref s) = safety {
             env.storage().persistent().set(&DataKey::Safety, &s);
         }
-        env.storage().persistent().set(&DataKey::Paused, &false);
+        env.storage().persistent().set(&DataKey::Paused, &PauseState::NotPaused);
         let eo = event_only.unwrap_or(false);
         env.storage().persistent().set(&DataKey2::ContractFlags, &(false, eo));
         env.events().publish((EVENT_INIT, admin.clone()), (safety, eo));
     }
 
-    /// Pause the contract (Admin only).
+    /// Soft-pause the contract (Admin only).
     ///
-    /// When paused, all state-mutating operations are disabled to protect the system.
+    /// `SoftPaused` blocks reports and deposits but **allows** `claim`, so
+    /// holders can still withdraw their funds during incident response.
     /// This operation is idempotent.
     ///
     /// ### Parameters
@@ -1954,14 +1978,17 @@ impl RevoraRevenueShare {
         if caller != admin {
             return Err(RevoraError::NotAuthorized);
         }
-        env.storage().persistent().set(&DataKey::Paused, &true);
+        env.storage().persistent().set(&DataKey::Paused, &PauseState::SoftPaused);
+        // Legacy compatibility event
         env.events().publish((EVENT_PAUSED, caller.clone()), ());
+        // Versioned tier event
+        env.events().publish((EVENT_PAUSED2, caller.clone()), (PauseState::SoftPaused,));
         Ok(())
     }
 
     /// Unpause the contract (Admin only).
     ///
-    /// Re-enables state-mutating operations after a pause.
+    /// Re-enables all operations after a pause.
     /// This operation is idempotent.
     ///
     /// ### Parameters
@@ -1973,14 +2000,38 @@ impl RevoraRevenueShare {
         if caller != admin {
             return Err(RevoraError::NotAuthorized);
         }
-        env.storage().persistent().set(&DataKey::Paused, &false);
+        env.storage().persistent().set(&DataKey::Paused, &PauseState::NotPaused);
         env.events().publish((EVENT_UNPAUSED, caller.clone()), ());
+        env.events().publish((EVENT_PAUSED2, caller.clone()), (PauseState::NotPaused,));
         Ok(())
     }
 
-    /// Pause the contract (Safety role only).
+    /// Hard-pause the contract (Admin only).
     ///
-    /// Allows the safety role to trigger an emergency pause.
+    /// `HardPaused` blocks **every** state-mutating operation including `claim`.
+    /// Use this tier only when funds must be fully locked (e.g. critical exploit).
+    /// Only the admin can escalate to HardPaused; the safety role is limited to SoftPaused.
+    ///
+    /// ### Parameters
+    /// - `caller`: The address of the admin (must match initialized admin).
+    pub fn hard_pause_admin(env: Env, caller: Address) -> Result<(), RevoraError> {
+        caller.require_auth();
+        let admin: Address =
+            env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
+        if caller != admin {
+            return Err(RevoraError::NotAuthorized);
+        }
+        env.storage().persistent().set(&DataKey::Paused, &PauseState::HardPaused);
+        env.events().publish((EVENT_PAUSED, caller.clone()), ());
+        env.events().publish((EVENT_PAUSED2, caller.clone()), (PauseState::HardPaused,));
+        Ok(())
+    }
+
+    /// Soft-pause the contract (Safety role only).
+    ///
+    /// `SoftPaused` blocks reports and deposits but **allows** `claim`, so
+    /// holders can still withdraw their funds during incident response.
+    /// The safety role cannot escalate to `HardPaused`; only the admin can.
     /// This operation is idempotent.
     ///
     /// ### Parameters
@@ -1992,8 +2043,9 @@ impl RevoraRevenueShare {
         if caller != safety {
             return Err(RevoraError::NotAuthorized);
         }
-        env.storage().persistent().set(&DataKey::Paused, &true);
+        env.storage().persistent().set(&DataKey::Paused, &PauseState::SoftPaused);
         env.events().publish((EVENT_PAUSED, caller.clone()), ());
+        env.events().publish((EVENT_PAUSED2, caller.clone()), (PauseState::SoftPaused,));
         Ok(())
     }
 
@@ -2011,19 +2063,62 @@ impl RevoraRevenueShare {
         if caller != safety {
             return Err(RevoraError::NotAuthorized);
         }
-        env.storage().persistent().set(&DataKey::Paused, &false);
+        env.storage().persistent().set(&DataKey::Paused, &PauseState::NotPaused);
         env.events().publish((EVENT_UNPAUSED, caller.clone()), ());
+        env.events().publish((EVENT_PAUSED2, caller.clone()), (PauseState::NotPaused,));
         Ok(())
     }
 
     /// Query the paused state of the contract.
+    ///
+    /// Returns `true` when the contract is in either `SoftPaused` or `HardPaused` state,
+    /// preserving backward compatibility with callers that only need a binary signal.
+    /// Use `get_pause_state` to distinguish between the two tiers.
     pub fn is_paused(env: Env) -> bool {
-        env.storage().persistent().get::<DataKey, bool>(&DataKey::Paused).unwrap_or(false)
+        matches!(
+            env.storage()
+                .persistent()
+                .get::<DataKey, PauseState>(&DataKey::Paused)
+                .unwrap_or(PauseState::NotPaused),
+            PauseState::SoftPaused | PauseState::HardPaused
+        )
     }
 
-    /// Helper: return error if contract is paused. Used by state-mutating entrypoints.
+    /// Return the current `PauseState` tier.
+    ///
+    /// - `NotPaused`  – all operations open.
+    /// - `SoftPaused` – reports/deposits blocked; `claim` allowed.
+    /// - `HardPaused` – all state-mutating operations blocked including `claim`.
+    pub fn get_pause_state(env: Env) -> PauseState {
+        env.storage()
+            .persistent()
+            .get::<DataKey, PauseState>(&DataKey::Paused)
+            .unwrap_or(PauseState::NotPaused)
+    }
+
+    /// Helper: block if the contract is in SoftPaused or HardPaused state.
+    /// Used by reports, deposits, and all non-claim state-mutating entrypoints.
     fn require_not_paused(env: &Env) -> Result<(), RevoraError> {
-        if env.storage().persistent().get::<DataKey, bool>(&DataKey::Paused).unwrap_or(false) {
+        let state = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PauseState>(&DataKey::Paused)
+            .unwrap_or(PauseState::NotPaused);
+        if matches!(state, PauseState::SoftPaused | PauseState::HardPaused) {
+            return Err(RevoraError::ContractPaused);
+        }
+        Ok(())
+    }
+
+    /// Helper: block only if the contract is in HardPaused state.
+    /// Used exclusively by `claim` so holders can still withdraw during a SoftPause.
+    fn require_not_hard_paused(env: &Env) -> Result<(), RevoraError> {
+        let state = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PauseState>(&DataKey::Paused)
+            .unwrap_or(PauseState::NotPaused);
+        if matches!(state, PauseState::HardPaused) {
             return Err(RevoraError::ContractPaused);
         }
         Ok(())
@@ -2368,7 +2463,15 @@ impl RevoraRevenueShare {
         let blacklist = if event_only {
             Vec::new(&env)
         } else {
-            Self::get_blacklist_page(env.clone(), issuer.clone(), namespace.clone(), token.clone(), 0, MAX_PAGE_LIMIT).0
+            Self::get_blacklist_page(
+                env.clone(),
+                issuer.clone(),
+                namespace.clone(),
+                token.clone(),
+                0,
+                MAX_PAGE_LIMIT,
+            )
+            .0
         };
 
         let mut actual_override = false;
@@ -3393,8 +3496,8 @@ impl RevoraRevenueShare {
     /// ### Returns
     /// The maximum allowed blacklist size for the offering.
     fn get_effective_blacklist_limit(env: &Env, offering_id: &OfferingId) -> u32 {
-        let key = DataKey::BlacklistSizeLimit(offering_id.clone());
-        env.storage().persistent().get::<DataKey, u32>(&key).unwrap_or(MAX_BLACKLIST_SIZE)
+        let key = DataKey2::BlacklistSizeLimit(offering_id.clone());
+        env.storage().persistent().get::<DataKey2, u32>(&key).unwrap_or(MAX_BLACKLIST_SIZE)
     }
 
     /// Set the per-offering blacklist size limit.
@@ -3696,9 +3799,7 @@ impl RevoraRevenueShare {
         enforce: bool,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        if env.storage().persistent().get::<DataKey, bool>(&DataKey::Paused).unwrap_or(false) {
-            return Err(RevoraError::ContractPaused);
-        }
+        Self::require_not_paused(&env)?;
 
         // Auth-first: authenticate before any state reads or side effects.
         // This prevents unauthenticated callers from probing offering existence
@@ -3763,9 +3864,7 @@ impl RevoraRevenueShare {
         concentration_bps: u32,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        if env.storage().persistent().get::<DataKey, bool>(&DataKey::Paused).unwrap_or(false) {
-            return Err(RevoraError::ContractPaused);
-        }
+        Self::require_not_paused(&env)?;
         issuer.require_auth();
 
         if concentration_bps > 10_000 {
@@ -4738,41 +4837,87 @@ impl RevoraRevenueShare {
     }
 
     /// Configure the reporting access window for an offering. If unset, always open.
-    pub fn set_report_window(env: Env, issuer: Address, namespace: Symbol, token: Address, start_timestamp: u64, end_timestamp: u64) -> Result<(), RevoraError> {
+    pub fn set_report_window(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        start_timestamp: u64,
+        end_timestamp: u64,
+    ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        let current_issuer = Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone()).ok_or(RevoraError::OfferingNotFound)?;
-        if current_issuer != issuer { return Err(RevoraError::OfferingNotFound); }
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
         issuer.require_auth();
         let window = AccessWindow { start_timestamp, end_timestamp };
         Self::validate_window(&window)?;
-        let offering_id = OfferingId { issuer: issuer.clone(), namespace: namespace.clone(), token: token.clone() };
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
         env.storage().persistent().set(&WindowDataKey::Report(offering_id), &window);
-        env.events().publish((EVENT_REPORT_WINDOW_SET, issuer, namespace, token), (start_timestamp, end_timestamp));
+        env.events().publish(
+            (EVENT_REPORT_WINDOW_SET, issuer, namespace, token),
+            (start_timestamp, end_timestamp),
+        );
         Ok(())
     }
 
     /// Configure the claiming access window for an offering. If unset, always open.
-    pub fn set_claim_window(env: Env, issuer: Address, namespace: Symbol, token: Address, start_timestamp: u64, end_timestamp: u64) -> Result<(), RevoraError> {
+    pub fn set_claim_window(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        start_timestamp: u64,
+        end_timestamp: u64,
+    ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        let current_issuer = Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone()).ok_or(RevoraError::OfferingNotFound)?;
-        if current_issuer != issuer { return Err(RevoraError::OfferingNotFound); }
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
         issuer.require_auth();
         let window = AccessWindow { start_timestamp, end_timestamp };
         Self::validate_window(&window)?;
-        let offering_id = OfferingId { issuer: issuer.clone(), namespace: namespace.clone(), token: token.clone() };
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
         env.storage().persistent().set(&WindowDataKey::Claim(offering_id), &window);
-        env.events().publish((EVENT_CLAIM_WINDOW_SET, issuer, namespace, token), (start_timestamp, end_timestamp));
+        env.events().publish(
+            (EVENT_CLAIM_WINDOW_SET, issuer, namespace, token),
+            (start_timestamp, end_timestamp),
+        );
         Ok(())
     }
 
     /// Read configured reporting window (if any) for an offering.
-    pub fn get_report_window(env: Env, issuer: Address, namespace: Symbol, token: Address) -> Option<AccessWindow> {
+    pub fn get_report_window(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Option<AccessWindow> {
         let offering_id = OfferingId { issuer, namespace, token };
         env.storage().persistent().get(&WindowDataKey::Report(offering_id))
     }
 
     /// Read configured claiming window (if any) for an offering.
-    pub fn get_claim_window(env: Env, issuer: Address, namespace: Symbol, token: Address) -> Option<AccessWindow> {
+    pub fn get_claim_window(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Option<AccessWindow> {
         let offering_id = OfferingId { issuer, namespace, token };
         env.storage().persistent().get(&WindowDataKey::Claim(offering_id))
     }
@@ -4784,6 +4929,9 @@ impl RevoraRevenueShare {
         token: Address,
         max_periods: u32,
     ) -> Result<i128, RevoraError> {
+        // HardPaused blocks claim; SoftPaused allows it so holders can withdraw during incidents.
+        Self::require_not_hard_paused(&env)?;
+
         holder.require_auth();
 
         let offering_id = OfferingId { issuer, namespace, token };
@@ -6351,5 +6499,3 @@ mod issue_370_373_tests {
         );
     }
 }
-
-
