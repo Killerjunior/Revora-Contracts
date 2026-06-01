@@ -75,6 +75,7 @@ Soroban contract for revenue-share offerings and blacklist management.
 | 18 | `InvalidPeriodId` | period_id is 0 where a positive value is required (#35). |
 | 25 | `ReportingWindowClosed` | Current ledger timestamp is outside the configured reporting window; `report_revenue` rejected. |
 | 26 | `ClaimWindowClosed` | Current ledger timestamp is outside the configured claiming window; `claim` rejected. |
+| 47 | `MissingReportForOverride` | `report_revenue` rejected when `override_existing=true` is requested for a period that has no existing persisted report. Emits `rev_omiss`. |
 
 Auth failures (e.g. wrong signer) are signaled by host/panic, not `RevoraError`. Use `try_register_offering`, `try_report_revenue`, and similar `try_*` client methods to receive contract errors as `Result`.
 
@@ -86,6 +87,7 @@ Auth failures (e.g. wrong signer) are signaled by host/panic, not `RevoraError`.
 | `rev_init` | `(issuer, token), (amount, period_id, blacklist_vec)` | First persisted report for a period. |
 | `rev_ovrd` | `(issuer, token), (new_amount, period_id, old_amount, blacklist_vec)` | Accepted correction of an existing persisted period (`override_existing=true`). |
 | `rev_rej` | `(issuer, token), (attempted_amount, period_id, existing_amount, blacklist_vec)` | Duplicate report attempt for an existing period when `override_existing=false`; no state change. |
+| `rev_omiss` | (`issuer, token`), (`attempted_amount, period_id`) | Rejected override attempt when `override_existing=true` is used for a period with no prior report. |
 | `rev_rep` | `(issuer, token), (amount, period_id, blacklist_vec)` | Receipt for an accepted persisted report call (initial or override). Use `rev_init` plus `rev_ovrd` to reconstruct audit totals. |
 | `bl_add` | `(token, caller), investor` | After `blacklist_add`. |
 | `bl_rem` | `(token, caller), investor` | After `blacklist_remove`. |

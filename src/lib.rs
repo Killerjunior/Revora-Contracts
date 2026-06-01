@@ -215,6 +215,7 @@ const EVENT_REVENUE_REPORT_INITIAL_ASSET: Symbol = symbol_short!("rev_inia");
 const EVENT_REVENUE_REPORT_OVERRIDE: Symbol = symbol_short!("rev_ovrd");
 const EVENT_REVENUE_REPORT_OVERRIDE_ASSET: Symbol = symbol_short!("rev_ovra");
 const EVENT_REVENUE_REPORT_REJECTED: Symbol = symbol_short!("rev_rej");
+const EVENT_REVENUE_REPORT_MISSING_OVERRIDE: Symbol = symbol_short!("rev_omiss");
 const EVENT_REVENUE_REPORT_REJECTED_ASSET: Symbol = symbol_short!("rev_reja");
 pub const EVENT_SCHEMA_VERSION_V2: u32 = 2;
 
@@ -299,6 +300,7 @@ const EVENT_TYPE_OFFER: Symbol = symbol_short!("offer");
 const EVENT_TYPE_REV_INIT: Symbol = symbol_short!("rv_init");
 const EVENT_TYPE_REV_OVR: Symbol = symbol_short!("rv_ovr");
 const EVENT_TYPE_REV_REJ: Symbol = symbol_short!("rv_rej");
+const EVENT_TYPE_REV_OMISS: Symbol = symbol_short!("rv_omiss");
 const EVENT_TYPE_REV_REP: Symbol = symbol_short!("rv_rep");
 const EVENT_TYPE_CLAIM: Symbol = symbol_short!("claim");
 const EVENT_REPORT_WINDOW_SET: Symbol = symbol_short!("rep_win");
@@ -2610,6 +2612,29 @@ impl RevoraRevenueShare {
                 }
                 None => {
                     if override_existing {
+                        env.events().publish(
+                            (
+                                EVENT_REVENUE_REPORT_MISSING_OVERRIDE,
+                                issuer.clone(),
+                                namespace.clone(),
+                                token.clone(),
+                            ),
+                            (amount, period_id),
+                        );
+                        env.events().publish(
+                            (
+                                EVENT_INDEXED_V2,
+                                EventIndexTopicV2 {
+                                    version: 2,
+                                    event_type: EVENT_TYPE_REV_OMISS,
+                                    issuer: issuer.clone(),
+                                    namespace: namespace.clone(),
+                                    token: token.clone(),
+                                    period_id,
+                                },
+                            ),
+                            (amount, period_id, payout_asset.clone()),
+                        );
                         return Err(RevoraError::MissingReportForOverride);
                     }
                     // preserve existing initial-report behavior when override_existing=false
