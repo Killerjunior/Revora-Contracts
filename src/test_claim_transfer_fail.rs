@@ -463,8 +463,8 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
     // Register a second offering with a normal Stellar asset token
     let offering_token_b = Address::generate(&env);
     let admin_b = Address::generate(&env);
-    let payment_token_b = env.register_stellar_asset_contract_v2(admin_b.clone());
-    token::StellarAssetClient::new(&env, &payment_token_b.address()).mint(&issuer, &100_000);
+    let payment_token_b = env.register_stellar_asset_contract_v2(admin_b.clone()).address();
+    token::StellarAssetClient::new(&env, &payment_token_b).mint(&issuer, &100_000);
 
     revora.register_offering(
         &issuer,
