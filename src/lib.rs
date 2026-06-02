@@ -173,7 +173,26 @@ mod test_min_revenue_threshold_boundary;
 #[cfg(test)]
 mod test_claim_transfer_fail;
 #[cfg(test)]
-mod test_blacklist_batch_gas;
+mod test_pause_tiers;
+#[cfg(test)]
+mod test_snapshot_monotonicity_replay;
+
+/// Two-tier pause state stored at `DataKey::Paused`.
+///
+/// - `NotPaused`  – normal operation; all entrypoints are open.
+/// - `SoftPaused` – blocks reports and deposits but **allows** `claim`, so
+///                  holders can still withdraw their funds during incident response.
+/// - `HardPaused` – blocks every state-mutating operation including `claim`.
+///
+/// Wire values are stable: do not renumber.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PauseState {
+    NotPaused = 0,
+    SoftPaused = 1,
+    HardPaused = 2,
+}
 
 // â”€â”€ Event symbols â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const EVENT_REVENUE_REPORTED: Symbol = symbol_short!("rev_rep");
